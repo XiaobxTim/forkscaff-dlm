@@ -17,7 +17,7 @@ import dllm
 
 @dataclass
 class ScriptArguments:
-    model_name_or_path: str = "dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1"
+    model_name_or_path: str = "dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1"
     seed: int = 42
     chat_template: bool = True
     visualize: bool = True

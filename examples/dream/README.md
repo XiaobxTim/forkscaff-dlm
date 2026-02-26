@@ -12,7 +12,7 @@ Resources and examples for training (finetuning & pretraining) and evaluating di
 
 <!-- ## Setup
 > [!IMPORTANT]  
-> **Slurm users:** Update `scripts/train.slurm.sh` and `mkdir .logs`: see [(optional) Slurm setup](/README.md/#optional-slurm-setup) for details.
+> **Slurm users:** Update `scripts/train.slurm.sh` and `mkdir .logs`: see [(optional) Slurm setup](/README.md#optional-slurm-setup) for details.
 > -->
 
 
@@ -48,7 +48,7 @@ examples/dream
 
 ## Training
   
-> Read [Useful tips for training](/README.md/#useful-tips-for-training) and [(optional) Slurm setup](/README.md/#optional-slurm-setup) before training.
+> Read [Useful tips for training](/README.md#useful-tips-for-training) and [(optional) Slurm setup](/README.md#optional-slurm-setup) before training.
 
 ### SFT
 For example, to SFT [`Dream-v0-Base-7B`](https://huggingface.co/Dream-org/Dream-v0-Base-7B) on the [`alpaca`](https://huggingface.co/datasets/tatsu-lab/alpaca) dataset for instruction following on 8 GPUs, run:
@@ -137,7 +137,7 @@ python examples/dream/chat.py --model_name_or_path "Dream-org/Dream-v0-Instruct-
 ```
 
 ## Evaluation  
-> Read [(optional) Evaluation setup](/README.md/#optional-evaluation-setup) before running evaluation. 
+> Read [(optional) Evaluation setup](/README.md#optional-evaluation-setup) before running evaluation. 
 
 For example, to evaluate [`Dream-v0-Instruct-7B`](https://huggingface.co/Dream-org/Dream-v0-Instruct-7B) on [`gsm8k`](https://huggingface.co/datasets/openai/gsm8k) using 4 GPUs, run:
 ```shell

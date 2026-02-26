@@ -24,13 +24,12 @@ def cart_weight(
     device = masked_mask.device
 
     idx = torch.arange(l, device=device)
-    dist_matrix = (idx[None, :] - idx[:, None]).abs() - 1
-    dist_matrix = torch.clamp(dist_matrix, min=0)  # (l, l)
+    dist_matrix = idx[None, :] - idx[:, None]  # (l, l) signed distance
     geo_matrix = (
         torch.log(torch.tensor(p, device=device))
-        + (dist_matrix - 1).clamp(min=0) * torch.log(torch.tensor(1 - p, device=device))
-    ).exp() * 0.5  # Ensure numerical stability
-    geo_matrix.masked_fill_(dist_matrix == 0, 0.0)  # ignore distance = 0
+        + (dist_matrix.abs() - 1).clamp(min=0) * torch.log(torch.tensor(1 - p, device=device))
+    ).exp() * 0.5
+    geo_matrix.masked_fill_(dist_matrix == 0, 0.0)
 
     valid_mask = (~masked_mask).float()  # (b, l), 1 = unmasked
     weights = valid_mask @ geo_matrix.T  # (b, l)

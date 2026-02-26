@@ -11,7 +11,7 @@ export TORCH_DISTRIBUTED_DEBUG=DETAIL       # Provide detailed logging for PyTor
 
 # ===== Basic Settings =====
 # Use HF hub path for portability; override with --model_name_or_path if using a local path.
-model_name_or_path="dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1"
+model_name_or_path="dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1"
 num_gpu=1
 model_type="normal"   # normal | coder
 

@@ -6,7 +6,7 @@ accelerate launch \
     --model bert \
     --apply_chat_template \
     --num_fewshot 0 \
-    --model_args "pretrained=dllm-collection/ModernBERT-base-chat-v0.1,max_new_tokens=256,steps=256,block_size=32"
+    --model_args "pretrained=dllm-hub/ModernBERT-base-chat-v0.1,max_new_tokens=256,steps=256,block_size=32"
 """
 
 from dataclasses import dataclass

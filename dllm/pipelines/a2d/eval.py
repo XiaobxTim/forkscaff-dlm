@@ -6,9 +6,9 @@ accelerate launch \
     --model a2d_mdlm \
     --apply_chat_template \
     --num_fewshot 5 \
-    --model_args "pretrained=dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1,max_new_tokens=256,steps=256,block_size=32,cfg_scale=0.0"
+    --model_args "pretrained=dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1,max_new_tokens=256,steps=256,block_size=32,cfg_scale=0.0"
 
-For BD3LM: use --model a2d_bd3lm and pretrained=dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1
+For BD3LM: use --model a2d_bd3lm and pretrained=dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1
 """
 
 from lm_eval.__main__ import cli_evaluate

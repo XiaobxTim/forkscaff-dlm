@@ -1,13 +1,13 @@
 # A2D (AR-to-Diffusion)
 
-[![Hugging Face Checkpoints](https://img.shields.io/badge/Hugging%20Face-Checkpoints-yellow)](https://huggingface.co/collections/dllm-collection/tiny-a2d)
+[![Hugging Face Checkpoints](https://img.shields.io/badge/Hugging%20Face-Checkpoints-yellow)](https://huggingface.co/collections/dllm-hub/tiny-a2d)
 [![W&B Report](https://img.shields.io/badge/W&B-Report-white?logo=weightsandbiases)](https://wandb.ai/asap-zzhou/dllm/reports/dLLM-Tiny-A2D--VmlldzoxNTI2NTEzOA)
 
 
 This directory provides two key sets of resources:
 
 - **Warmup**: Tutorials for continual pretraining and SFTing any autoregressive model on small datasets to generate text with [MDLM](#warmup-mdlm) (masked diffusion) or [BD3LM](#warmup-bd3lm) (block diffusion).
-- **[`Tiny-A2D`](#tiny-a2d)**: The exact training, inference, and evaluation scripts for developing: [`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1) and [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1).
+- **[`Tiny-A2D`](#tiny-a2d)**: The exact training, inference, and evaluation scripts for developing: [`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1) and [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1).
 For detailed experimental results and reproduction instructions, please see our [![blog](https://img.shields.io/badge/W&B-white?logo=weightsandbiases) Tiny-A2D Report](https://wandb.ai/asap-zzhou/dllm/reports/dLLM-Tiny-A2D--VmlldzoxNTI2NTEzOA).
 
 ## Files
@@ -231,16 +231,16 @@ python -u examples/a2d/bd3lm/chat.py \
 
 ## `Tiny-A2D`
 
-Here we show the exact commands we use to train / interact with / evaluation the [`Tiny-A2D`](https://huggingface.co/collections/dllm-collection/tiny-a2d) models:
-[`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1) and [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1).
+Here we show the exact commands we use to train / interact with / evaluate the [`Tiny-A2D`](https://huggingface.co/collections/dllm-hub/tiny-a2d) models:
+[`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1) and [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1).
 For training curves and other details, please see [![blog](https://img.shields.io/badge/W&B-white?logo=weightsandbiases) Tiny-A2D Report](https://wandb.ai/asap-zzhou/dllm/reports/dLLM-Tiny-A2D--VmlldzoxNTI2NTEzOA).
 
 ### Training
-> Read [Useful tips for training](/README.md/#useful-tips-for-training) and [(optional) Slurm setup](/README.md/#optional-slurm-setup) before training.
+> Read [Useful tips for training](/README.md#useful-tips-for-training) and [(optional) Slurm setup](/README.md#optional-slurm-setup) before training.
 
-The [`Tiny-A2D`](https://huggingface.co/collections/dllm-collection/tiny-a2d) models are trained purely with SFT.
+The [`Tiny-A2D`](https://huggingface.co/collections/dllm-hub/tiny-a2d) models are trained purely with SFT.
 
-To reproduce [`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1) (with MDLM & SFT), run the command below (about 10 hours on 64 A100s):
+To reproduce [`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1) (with MDLM & SFT), run the command below (about 10 hours on 64 A100s):
 ```shell
 WANDB_MODE=online sbatch --nodes=8 --gres=gpu:8 scripts/train.slurm.sh \
     --accelerate_config "zero2" \
@@ -256,7 +256,7 @@ WANDB_MODE=online sbatch --nodes=8 --gres=gpu:8 scripts/train.slurm.sh \
     --output_dir ".models/a2d/Qwen3-0.6B/tulu-3-sft-mixture+smoltalk+opc-sft-stage1&2/epochs-10-bs-2048-len-1024"
 ```
 
-To reproduce [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1) (with BD3LM & SFT), run the command below (about 10 hours on 64 A100s):
+To reproduce [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1) (with BD3LM & SFT), run the command below (about 10 hours on 64 A100s):
 ```shell
 WANDB_MODE=online sbatch --nodes=8 --gres=gpu:8 scripts/train.slurm.sh \
     --accelerate_config "zero2" \
@@ -277,38 +277,38 @@ WANDB_MODE=online sbatch --nodes=8 --gres=gpu:8 scripts/train.slurm.sh \
 
 To chat with the model:
 ```shell
-python -u examples/a2d/mdlm/chat.py --model_name_or_path "dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1"
-python -u examples/a2d/bd3lm/chat.py --model_name_or_path "dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1"
+python -u examples/a2d/mdlm/chat.py --model_name_or_path "dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1"
+python -u examples/a2d/bd3lm/chat.py --model_name_or_path "dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1"
 ```
 
 ### Evaluation
 
-> Read [(optional) Evaluation setup](/README.md/#optional-evaluation-setup) before running evaluation.
+> Read [(optional) Evaluation setup](/README.md#optional-evaluation-setup) before running evaluation.
 
-To evaluate [`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1) and [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1) on [`gsm8k`](https://huggingface.co/datasets/openai/gsm8k) using 4 GPUs, run:
+To evaluate [`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1) and [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1) on [`gsm8k`](https://huggingface.co/datasets/openai/gsm8k) using 4 GPUs, run:
 ```shell
 # Use model_args to adjust the sampler arguments for evaluation.
 accelerate launch --num_processes 4 \
     dllm/pipelines/a2d/eval.py \
     --tasks "gsm8k_cot" \
-    --model "mdlm" \
+    --model "a2d_mdlm" \
     --apply_chat_template \
     --num_fewshot 0 \
-    --model_args "pretrained=dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1,max_new_tokens=256,steps=256,block_size=256,cfg=0.0,temperature=0.0"
+    --model_args "pretrained=dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1,max_new_tokens=256,steps=256,block_size=256,cfg_scale=0.0,temperature=0.0"
 
 accelerate launch --num_processes 4 \
     dllm/pipelines/a2d/eval.py \
     --tasks "gsm8k_cot" \
-    --model "bd3lm" \
+    --model "a2d_bd3lm" \
     --apply_chat_template \
     --num_fewshot 0 \
-    --model_args "pretrained=dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1,max_new_tokens=256,steps=256,block_size=32,cfg=0.0,temperature=0.0"
+    --model_args "pretrained=dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1,max_new_tokens=256,steps=256,block_size=32,cfg_scale=0.0,temperature=0.0"
 ```
 
-To automatically evaluate [`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1) and [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1) on all benchmarks, run:
+To automatically evaluate [`Qwen3-0.6B-diffusion-mdlm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1) and [`Qwen3-0.6B-diffusion-bd3lm-v0.1`](https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1) on all benchmarks, run:
 ```shell
-bash examples/a2d/mdlm/eval.sh --model_name_or_path "dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1" 
-bash examples/a2d/bd3lm/eval.sh --model_name_or_path "dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1" 
+bash examples/a2d/mdlm/eval.sh --model_name_or_path "dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1" 
+bash examples/a2d/bd3lm/eval.sh --model_name_or_path "dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1" 
 ```
 
 
@@ -344,7 +344,7 @@ bash examples/a2d/bd3lm/eval.sh --model_name_or_path "dllm-collection/Qwen3-0.6B
   <!-- mdlm v0.1 -->
   <tr>
     <td style="padding: 8px;">
-      <a href="https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1"><code>Qwen3-0.6B-diffusion-mdlm-v0.1</code></a> (Reproduced)
+      <a href="https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1"><code>Qwen3-0.6B-diffusion-mdlm-v0.1</code></a> (Reproduced)
     </td>
     <td>29.3</td><td>26.7</td><td>8.7</td>
     <td>40.0</td><td>17.3</td><td>42.1</td>
@@ -354,7 +354,7 @@ bash examples/a2d/bd3lm/eval.sh --model_name_or_path "dllm-collection/Qwen3-0.6B
   <!-- bd3lm v0.1 -->
   <tr>
     <td style="padding: 8px;">
-      <a href="https://huggingface.co/dllm-collection/Qwen3-0.6B-diffusion-bd3lm-v0.1"><code>Qwen3-0.6B-diffusion-bd3lm-v0.1</code></a> (Reproduced)
+      <a href="https://huggingface.co/dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1"><code>Qwen3-0.6B-diffusion-bd3lm-v0.1</code></a> (Reproduced)
     </td>
     <td>46.3</td><td>26.6</td><td>12.9</td>
     <td>39.1</td><td>13.8</td><td>39.3</td>
@@ -397,7 +397,7 @@ bash examples/a2d/bd3lm/eval.sh --model_name_or_path "dllm-collection/Qwen3-0.6B
   <!-- mdlm v0.1  -->
   <tr>
     <td style="padding: 8px;">
-      <a href="https://huggingface.co/dllm-collection/Qwen2.5-Coder-0.5B-Instruct-diffusion-mdlm-v0.1"><code>Qwen2.5-Coder-0.5B-Instruct-diffusion-mdlm-v0.1</code></a> (Reproduced)
+      <a href="https://huggingface.co/dllm-hub/Qwen2.5-Coder-0.5B-Instruct-diffusion-mdlm-v0.1"><code>Qwen2.5-Coder-0.5B-Instruct-diffusion-mdlm-v0.1</code></a> (Reproduced)
     </td>
     <td>28.1</td>
     <td>23.0</td>
@@ -406,7 +406,7 @@ bash examples/a2d/bd3lm/eval.sh --model_name_or_path "dllm-collection/Qwen3-0.6B
   <!-- bd3lm v0.1  -->
   <tr>
     <td style="padding: 8px;">
-      <a href="https://huggingface.co/dllm-collection/Qwen2.5-Coder-0.5B-Instruct-diffusion-bd3lm-v0.1"><code>Qwen2.5-Coder-0.5B-Instruct-diffusion-bd3lm-v0.1</code></a> (Reproduced)
+      <a href="https://huggingface.co/dllm-hub/Qwen2.5-Coder-0.5B-Instruct-diffusion-bd3lm-v0.1"><code>Qwen2.5-Coder-0.5B-Instruct-diffusion-bd3lm-v0.1</code></a> (Reproduced)
     </td>
     <td>39.0</td>
     <td>33.2</td>

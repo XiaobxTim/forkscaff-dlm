@@ -47,7 +47,7 @@ python dllm/pipelines/editflow/convert.py \
 
 ## Training
 
-> Read [Useful tips for training](/README.md/#useful-tips-for-training) and [(optional) Slurm setup](/README.md/#optional-slurm-setup) before training.
+> Read [Useful tips for training](/README.md#useful-tips-for-training) and [(optional) Slurm setup](/README.md#optional-slurm-setup) before training.
 >
 > When training larger source models (e.g., [`LLaDA-8B-Base`](https://huggingface.co/GSAI-ML/LLaDA-8B-Base) or [`Dream-v0-Base-7B`](https://huggingface.co/Dream-org/Dream-v0-Base-7B)), consider 
 > using `--config_file scripts/accelerate_configs/fsdp.yaml`, reducing `per_device_train_batch_size` or enabling `--load_in_4bit True --lora True` to reduce VRAM usage.

@@ -10,7 +10,7 @@ export NCCL_DEBUG=warn                      # Show NCCL warnings for better diag
 export TORCH_DISTRIBUTED_DEBUG=DETAIL       # Provide detailed logging for PyTorch distributed debugging
 
 # ===== Basic Settings =====
-model_name_or_path="dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1"
+model_name_or_path="dllm-hub/Qwen3-0.6B-diffusion-mdlm-v0.1"
 num_gpu=1
 model_type="normal"   # normal | coder
 

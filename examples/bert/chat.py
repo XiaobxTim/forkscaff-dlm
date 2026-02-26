@@ -17,7 +17,7 @@ import dllm
 
 @dataclass
 class ScriptArguments:
-    model_name_or_path: str = "dllm-collection/ModernBERT-large-chat-v0.1"
+    model_name_or_path: str = "dllm-hub/ModernBERT-large-chat-v0.1"
     seed: int = 42
     chat_template: bool = True
     visualize: bool = True
