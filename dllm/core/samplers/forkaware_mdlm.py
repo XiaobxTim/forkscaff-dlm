@@ -41,6 +41,9 @@ class ForkAwareMDLMSamplerConfig(BaseSamplerConfig):
     min_history_for_consistency: int = 3
     entropy_threshold: float = 4.5
     consistency_threshold: float = 0.75
+    lambda_confidence: float = 1.0
+    lambda_structural: float = 0.5
+    commit_top_m: int = 1
 
 
 @dataclass
@@ -697,28 +700,217 @@ class ForkAwareMDLMSampler(BaseSampler):
     ):
         """
         Minimal eligibility gate:
-        eligible if entropy is low enough and consistency is high enough.
-
-        Args:
-            structural_indices: Tensor [B, K]
-            entropy_scores: Tensor [B, K]
-            consistency_scores: Tensor [B, K]
-            entropy_threshold: float
-            consistency_threshold: float
-
-        Returns:
-            eligible_indices: Tensor [B, K]
-            eligible_mask: Tensor [B, K] (bool)
+        low entropy + high consistency
         """
         eligible_mask = (
             (entropy_scores <= entropy_threshold)
             & (consistency_scores >= consistency_threshold)
         )
+        return eligible_mask
 
+
+    def finalize_eligible_candidates(
+        self,
+        structural_indices,
+        eligible_mask,
+    ):
+        """
+        Finalize eligibility output for downstream usage.
+        """
         eligible_indices = torch.full_like(structural_indices, fill_value=-1)
         eligible_indices[eligible_mask] = structural_indices[eligible_mask]
 
-        return eligible_indices, eligible_mask
+        eligible_counts = eligible_mask.sum(dim=-1)
+
+        return eligible_indices, eligible_counts
+
+
+    def compute_candidate_confidence(
+        self,
+        logits,
+        eligible_indices,
+    ):
+        """
+        Compute local confidence C(s;t) = max_v p_theta(x_s=v | x^(t))
+        for eligible candidates.
+
+        Args:
+            logits: Tensor [B, T, V]
+            eligible_indices: Tensor [B, K], invalid positions are -1
+
+        Returns:
+            confidence_scores: Tensor [B, K]
+        """
+        probs = torch.softmax(logits, dim=-1)          # [B, T, V]
+        max_probs = probs.max(dim=-1).values           # [B, T]
+
+        B, K = eligible_indices.shape
+        confidence_scores = torch.zeros(
+            (B, K),
+            dtype=max_probs.dtype,
+            device=logits.device,
+        )
+
+        for j in range(B):
+            for k in range(K):
+                pos = int(eligible_indices[j, k].item())
+                if pos < 0:
+                    confidence_scores[j, k] = 0.0
+                    continue
+
+                confidence_scores[j, k] = max_probs[j, pos]
+
+        return confidence_scores
+
+    def normalize_structural_scores_on_eligible(
+        self,
+        structural_scores,
+        eligible_mask,
+    ):
+        """
+        Normalize structural scores within eligible candidates.
+
+        Args:
+            structural_scores: Tensor [B, K]
+            eligible_mask: Tensor [B, K] bool
+
+        Returns:
+            normalized_scores: Tensor [B, K]
+        """
+        B, K = structural_scores.shape
+        normalized_scores = torch.zeros_like(structural_scores)
+
+        for j in range(B):
+            valid_mask = eligible_mask[j]
+            valid_count = int(valid_mask.sum().item())
+
+            if valid_count == 0:
+                continue
+
+            vals = structural_scores[j][valid_mask]
+            vmin = vals.min()
+            vmax = vals.max()
+
+            if float(vmax - vmin) < 1e-8:
+                normalized_scores[j][valid_mask] = 1.0
+            else:
+                normalized_scores[j][valid_mask] = (vals - vmin) / (vmax - vmin)
+
+        return normalized_scores
+
+    def compute_commit_priority_minimal(
+        self,
+        confidence_scores,
+        normalized_structural_scores,
+        eligible_mask,
+        lambda_confidence,
+        lambda_structural,
+    ):
+        """
+        Compute minimal commit priority on eligible candidates.
+
+        P(s;t) = lambda_C * confidence + lambda_S * normalized_structural_score
+
+        Args:
+            confidence_scores: Tensor [B, K]
+            normalized_structural_scores: Tensor [B, K]
+            eligible_mask: Tensor [B, K] bool
+            lambda_confidence: float
+            lambda_structural: float
+
+        Returns:
+            priority_scores: Tensor [B, K]
+        """
+        priority_scores = (
+            lambda_confidence * confidence_scores
+            + lambda_structural * normalized_structural_scores
+        )
+
+        priority_scores = priority_scores.masked_fill(~eligible_mask, float("-inf"))
+        return priority_scores
+    
+    def select_top_commit_candidates(
+        self,
+        eligible_indices,
+        priority_scores,
+        top_m,
+    ):
+        """
+        Select Top-M commit candidates from eligible set.
+
+        Args:
+            eligible_indices: Tensor [B, K], invalid positions are -1
+            priority_scores: Tensor [B, K], invalid positions should already be -inf
+            top_m: int
+
+        Returns:
+            commit_indices: Tensor [B, K], selected positions kept, others -1
+            commit_mask: Tensor [B, K] bool
+        """
+        B, K = eligible_indices.shape
+        commit_mask = torch.zeros_like(eligible_indices, dtype=torch.bool)
+
+        for j in range(B):
+            valid_mask = eligible_indices[j] >= 0
+            valid_count = int(valid_mask.sum().item())
+
+            if valid_count == 0:
+                continue
+
+            m = min(top_m, valid_count)
+
+            topk_idx = torch.topk(priority_scores[j], k=m, dim=-1).indices
+            commit_mask[j, topk_idx] = True
+
+        commit_indices = torch.full_like(eligible_indices, fill_value=-1)
+        commit_indices[commit_mask] = eligible_indices[commit_mask]
+
+        return commit_indices, commit_mask
+    
+    def commit_indices_to_mask(
+        self,
+        commit_indices,
+        seq_len,
+    ):
+        """
+        Convert commit_indices [B, K] into a boolean mask [B, T].
+
+        Args:
+            commit_indices: Tensor [B, K], invalid positions are -1
+            seq_len: int
+
+        Returns:
+            commit_transfer_mask: Tensor [B, T] bool
+            commit_counts: Tensor [B]
+        """
+        B, K = commit_indices.shape
+        device = commit_indices.device
+
+        commit_transfer_mask = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
+
+        for j in range(B):
+            for pos in commit_indices[j].tolist():
+                pos = int(pos)
+                if pos >= 0:
+                    commit_transfer_mask[j, pos] = True
+
+        commit_counts = commit_transfer_mask.sum(dim=-1)
+        return commit_transfer_mask, commit_counts
+    
+    def debug_print_commit_integration(
+        self,
+        commit_counts,
+        num_transfer_tokens,
+        step_idx,
+    ):
+        B = commit_counts.shape[0]
+        for j in range(B):
+            print(
+                f"[COMMIT INTEGRATION] sample={j}, "
+                f"step={step_idx}, "
+                f"struct_commit={int(commit_counts[j].item())}, "
+                f"budget={int(num_transfer_tokens[j].item())}"
+            )
     
     @torch.no_grad()
     def sample(
@@ -942,7 +1134,7 @@ class ForkAwareMDLMSampler(BaseSampler):
                     min_history=config.min_history_for_consistency,
                 )
 
-                eligible_indices, eligible_mask = self.get_eligible_candidates_minimal(
+                eligible_mask = self.get_eligible_candidates_minimal(
                     structural_indices=structural_indices,
                     entropy_scores=entropy_scores,
                     consistency_scores=consistency_scores,
@@ -950,44 +1142,107 @@ class ForkAwareMDLMSampler(BaseSampler):
                     consistency_threshold=config.consistency_threshold,
                 )
 
+                eligible_indices, eligible_counts = self.finalize_eligible_candidates(
+                    structural_indices=structural_indices,
+                    eligible_mask=eligible_mask,
+                )
 
-                # Per-position confidence used to pick which masks to commit this step
+                confidence_scores = self.compute_candidate_confidence(
+                    logits=logits,
+                    eligible_indices=eligible_indices,
+                )
+
+                normalized_structural_scores = self.normalize_structural_scores_on_eligible(
+                    structural_scores=structural_scores,
+                    eligible_mask=eligible_mask,
+                )
+
+                priority_scores = self.compute_commit_priority_minimal(
+                    confidence_scores=confidence_scores,
+                    normalized_structural_scores=normalized_structural_scores,
+                    eligible_mask=eligible_mask,
+                    lambda_confidence=config.lambda_confidence,
+                    lambda_structural=config.lambda_structural,
+                )
+
+                commit_indices, commit_mask = self.select_top_commit_candidates(
+                    eligible_indices=eligible_indices,
+                    priority_scores=priority_scores,
+                    top_m=config.commit_top_m,
+                )
+
+                # Per-position confidence used for fallback selection
                 if remasking == "low_confidence":
                     p = F.softmax(logits, dim=-1)
                     x0_p = torch.squeeze(
                         torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
-                    )  # [B, T] confidence of predicted token
+                    )  # [B, T]
                 elif remasking == "random":
-                    x0_p = torch.rand(
-                        (x0.shape[0], x0.shape[1]), device=x0.device
-                    )  # random scores
+                    x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
                 else:
                     raise NotImplementedError(remasking)
 
-                # Restrict selection window to the *current block's* tail region
+                # Restrict selection window to the current block's tail region
                 for j in range(B):
                     x0_p[j, prompt_lens[j] + (b + 1) * block_size :] = -np.inf
 
                 # Only allow updates at currently masked positions; keep others fixed
                 x0 = torch.where(mask_index, x0, x)
-                confidence = torch.where(
-                    mask_index, x0_p, -np.inf
-                )  # consider masked positions only
+                confidence = torch.where(mask_index, x0_p, -np.inf)
 
-                # Pick exactly `num_transfer_tokens[j, i]` highest-confidence positions per sample
-                transfer_index = torch.zeros_like(
-                    x0, dtype=torch.bool, device=x0.device
+                # ------------------------------------------------------------------
+                # Step 7.5 / 7.6: integrate 3.4 commit_indices into real transfer logic
+                # ------------------------------------------------------------------
+
+                # Convert [B, K] commit_indices -> [B, T] bool mask
+                commit_transfer_mask, commit_counts = self.commit_indices_to_mask(
+                    commit_indices=commit_indices,
+                    seq_len=x0.shape[1],
                 )
-                for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(
-                        confidence[j], k=num_transfer_tokens[j, i]
-                    )
+
+                # Safety: only keep currently masked positions
+                commit_transfer_mask = commit_transfer_mask & mask_index
+
+                # Safety: restrict to current block window as well
+                for j in range(B):
+                    commit_transfer_mask[j, prompt_lens[j] + (b + 1) * block_size :] = False
+
+                # Start transfer set from structural commit candidates
+                transfer_index = commit_transfer_mask.clone()
+
+                # Fill the remaining quota with original fallback selection
+                for j in range(B):
+                    budget = int(num_transfer_tokens[j, i])
+
+                    already_selected = int(transfer_index[j].sum().item())
+                    remaining = max(0, budget - already_selected)
+
+                    if remaining == 0:
+                        continue
+
+                    # Exclude already selected positions from fallback
+                    fallback_conf = confidence[j].clone()
+                    fallback_conf[transfer_index[j]] = -np.inf
+
+                    # Only select if there are still valid positions
+                    valid_count = int(torch.isfinite(fallback_conf).sum().item())
+                    if valid_count == 0:
+                        continue
+
+                    k_select = min(remaining, valid_count)
+                    _, select_index = torch.topk(fallback_conf, k=k_select)
                     transfer_index[j, select_index] = True
 
                 # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
                 if histories is not None:
                     histories.append(x.clone())
+
+                self.debug_print_commit_integration(
+                    commit_counts=commit_counts,
+                    num_transfer_tokens=num_transfer_tokens[:, i],
+                    step_idx=i,
+                )
 
         # ----- Output format -----
         if not return_dict:
