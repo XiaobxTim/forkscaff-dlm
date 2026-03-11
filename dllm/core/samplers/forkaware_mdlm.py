@@ -32,7 +32,7 @@ class ForkAwareMDLMSamplerConfig(BaseSamplerConfig):
     begin_suppress_tokens: list[int] | None = None
     right_shift_logits: bool = False
     probe_top_m: int = 16
-    probe_divergence: str = "l1"
+    probe_divergence: str = "js"
     structural_top_k: int = 4
     branch_top_k_values: int = 2   # 最小版只用 top-2
     alpha_struct: float = 1.0      # I_down 权重
@@ -44,6 +44,12 @@ class ForkAwareMDLMSamplerConfig(BaseSamplerConfig):
     lambda_confidence: float = 1.0
     lambda_structural: float = 0.5
     commit_top_m: int = 1
+    readiness_window: int = 4
+    readiness_boost: float = 1.0
+    readiness_decay: float = 0.8
+    lambda_readiness: float = 0.5
+    epsilon_ready: float = 0.3
+    enable_ready_scheduler: bool = True
 
 
 @dataclass
@@ -53,10 +59,43 @@ class ForkAwareMDLMSampler(BaseSampler):
         self.pred_history = {}
         self.branch_history = {}
 
+        self.readiness_map = None
+
     def reset_histories(self):
         self.pred_history = {}
         self.branch_history = {}
+    
+    def reset_scheduler_state(self):
+        self.readiness_map = None
 
+    def init_readiness_map(
+        self,
+        batch_size,
+        seq_len,
+        device,
+    ):
+        self.readiness_map = torch.zeros(
+            (batch_size, seq_len),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    def compute_ready_mask(
+        self,
+        mask_index,
+        epsilon_ready,
+    ):
+        """
+        Compute token-level ready mask from readiness_map.
+        Only currently masked positions can be ready.
+        """
+        if self.readiness_map is None:
+            return mask_index.clone()
+
+        ready_mask = self.readiness_map >= epsilon_ready
+        ready_mask = ready_mask & mask_index
+        return ready_mask
+    
     def get_step_state(
         self,
         x,
@@ -119,6 +158,27 @@ class ForkAwareMDLMSampler(BaseSampler):
 
         return counts
     
+    def apply_readiness_bias_to_entropy(
+        self,
+        entropy,
+        lambda_readiness,
+    ):
+        """
+        Add readiness bonus to entropy-based preselection score.
+
+        Args:
+            entropy: Tensor [B, T]
+            lambda_readiness: float
+
+        Returns:
+            biased_entropy: Tensor [B, T]
+        """
+        if self.readiness_map is None:
+            return entropy
+
+        return entropy + lambda_readiness * self.readiness_map.to(entropy.dtype)
+    
+
     def preselect_candidates(
         self,
         logits,
@@ -128,9 +188,13 @@ class ForkAwareMDLMSampler(BaseSampler):
         block_size,
         max_new_tokens,
         top_m,
+        config=None,
     ):
         """
         在当前 block 内，从 still-masked positions 中选出高熵候选。
+        这里加入:
+        1) readiness soft bias (3.5)
+        2) readiness-guided scheduler gating (3.6 minimal)
 
         Args:
             logits: [B, T, V]
@@ -139,6 +203,7 @@ class ForkAwareMDLMSampler(BaseSampler):
             block_idx: 当前 block 编号
             block_size: 当前 block 大小
             top_m: 每个 sample 最多保留多少个候选
+            config: sampler config
 
         Returns:
             candidate_indices: [B, K]
@@ -147,19 +212,49 @@ class ForkAwareMDLMSampler(BaseSampler):
         probs = F.softmax(logits, dim=-1)  # [B, T, V]
         entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1)  # [B, T]
 
+        # Step 3.5: readiness soft bias
+        lambda_readiness = getattr(config, "lambda_readiness", 0.0) if config is not None else 0.0
+        biased_entropy = self.apply_readiness_bias_to_entropy(
+            entropy=entropy,
+            lambda_readiness=lambda_readiness,
+        )
+
         B, T = entropy.shape
         candidate_mask = torch.zeros_like(mask_index, dtype=torch.bool)
 
+        # original block-local candidate window
         for j in range(B):
             start = prompt_lens[j] + block_idx * block_size
             end = min(start + block_size, prompt_lens[j] + max_new_tokens, T)
             if start < end:
                 candidate_mask[j, start:end] = mask_index[j, start:end]
 
+        # ------------------------------------------------------------------
+        # Step 3.6: readiness-guided online scheduler (minimal token-level)
+        # ------------------------------------------------------------------
+        if config is not None and getattr(config, "enable_ready_scheduler", False):
+            ready_mask = self.compute_ready_mask(
+                mask_index=mask_index,
+                epsilon_ready=config.epsilon_ready,
+            )
+
+            # only keep ready positions inside current block window
+            candidate_mask = candidate_mask & ready_mask
+
+            # safety fallback: if scheduler blocks everything for one sample,
+            # fall back to original block-local masked positions
+            for j in range(B):
+                if candidate_mask[j].sum() == 0:
+                    start = prompt_lens[j] + block_idx * block_size
+                    end = min(start + block_size, prompt_lens[j] + max_new_tokens, T)
+                    if start < end:
+                        candidate_mask[j, start:end] = mask_index[j, start:end]
+
+        # Apply candidate mask after scheduler
         masked_entropy = torch.where(
             candidate_mask,
-            entropy,
-            torch.full_like(entropy, float("-inf")),
+            biased_entropy,
+            torch.full_like(biased_entropy, float("-inf")),
         )
 
         valid_counts = candidate_mask.sum(dim=1)  # [B]
@@ -897,20 +992,45 @@ class ForkAwareMDLMSampler(BaseSampler):
         commit_counts = commit_transfer_mask.sum(dim=-1)
         return commit_transfer_mask, commit_counts
     
-    def debug_print_commit_integration(
+    def update_readiness_from_commits(
         self,
-        commit_counts,
-        num_transfer_tokens,
-        step_idx,
+        commit_indices,
+        mask_index,
+        readiness_window,
+        readiness_boost,
+        readiness_decay,
     ):
-        B = commit_counts.shape[0]
+        """
+        Update readiness_map using newly committed structural positions.
+
+        Args:
+            commit_indices: Tensor [B, K], invalid positions are -1
+            mask_index: Tensor [B, T], current masked positions
+        """
+        if self.readiness_map is None:
+            raise RuntimeError("readiness_map is not initialized.")
+
+        B, K = commit_indices.shape
+        _, T = mask_index.shape
+
         for j in range(B):
-            print(
-                f"[COMMIT INTEGRATION] sample={j}, "
-                f"step={step_idx}, "
-                f"struct_commit={int(commit_counts[j].item())}, "
-                f"budget={int(num_transfer_tokens[j].item())}"
-            )
+            for pos in commit_indices[j].tolist():
+                pos = int(pos)
+                if pos < 0:
+                    continue
+
+                # propagate to local downstream masked region
+                for d in range(1, readiness_window + 1):
+                    nxt = pos + d
+                    if nxt >= T:
+                        break
+
+                    # only unresolved/masked positions receive readiness boost
+                    if not bool(mask_index[j, nxt].item()):
+                        continue
+
+                    self.readiness_map[j, nxt] += readiness_boost * (readiness_decay ** (d - 1))
+    
     
     @torch.no_grad()
     def sample(
@@ -934,6 +1054,7 @@ class ForkAwareMDLMSampler(BaseSampler):
             BaseSamplerOutput with generated sequences, or raw tensor if return_dict=False.
         """
         self.reset_histories()
+        self.reset_scheduler_state()
 
         if config is None:
             config = ForkAwareMDLMSamplerConfig()
@@ -1012,6 +1133,13 @@ class ForkAwareMDLMSampler(BaseSampler):
         steps = math.ceil(steps / num_blocks)  # per-block step budget
         histories = [x.clone()] if return_dict else None
 
+        if self.readiness_map is None:
+            self.init_readiness_map(
+                batch_size=x.shape[0],
+                seq_len=x.shape[1],
+                device=x.device,
+            )
+
         for b in range(num_blocks):
             # Build a per-sample mask *within this block* (aligned to each prompt's tail)
             block_mask_index = torch.zeros(
@@ -1065,6 +1193,7 @@ class ForkAwareMDLMSampler(BaseSampler):
                     block_size=block_size,
                     max_new_tokens=max_new_tokens,
                     top_m=config.probe_top_m,
+                    config=config,
                 )
 
                 i_down_scores = self.estimate_downstream_influence(
@@ -1235,14 +1364,17 @@ class ForkAwareMDLMSampler(BaseSampler):
 
                 # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
+
+                self.update_readiness_from_commits(
+                    commit_indices=commit_indices,
+                    mask_index=mask_index,
+                    readiness_window=config.readiness_window,
+                    readiness_boost=config.readiness_boost,
+                    readiness_decay=config.readiness_decay,
+                )
+
                 if histories is not None:
                     histories.append(x.clone())
-
-                self.debug_print_commit_integration(
-                    commit_counts=commit_counts,
-                    num_transfer_tokens=num_transfer_tokens[:, i],
-                    step_idx=i,
-                )
 
         # ----- Output format -----
         if not return_dict:
