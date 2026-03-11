@@ -8,6 +8,8 @@ import transformers
 
 import dllm
 
+import time
+
 
 @dataclass
 class ScriptArguments:
@@ -29,6 +31,18 @@ class SamplerConfig(dllm.core.samplers.MDLMSamplerConfig):
     temperature: float = 0.0
     remasking: str = "low_confidence"
 
+def print_metrics(title, outputs):
+    print(f"\n[{title}]")
+    if not hasattr(outputs, "metrics"):
+        print("No metrics found in outputs.")
+        return
+
+    metrics = outputs.metrics
+    for k, v in metrics.items():
+        print(f"{k}: {v}")
+
+def mean_list(xs):
+    return sum(xs) / len(xs)
 
 parser = transformers.HfArgumentParser((ScriptArguments, SamplerConfig))
 script_args, sampler_config = parser.parse_args_into_dataclasses()
@@ -56,8 +70,14 @@ inputs = tokenizer.apply_chat_template(
     tokenize=True,
 )
 
+start = time.time()
 outputs = sampler.sample(inputs, sampler_config, return_dict=True)
+end = time.time()
 sequences = dllm.utils.sample_trim(tokenizer, outputs.sequences.tolist(), inputs)
+
+elapsed = end - start
+
+print_metrics("Sample Metrics", outputs)
 
 for iter, s in enumerate(sequences):
     print("\n" + "-" * 80)
@@ -66,50 +86,18 @@ for iter, s in enumerate(sequences):
     print(s.strip() if s.strip() else "<empty>")
 print("\n" + "=" * 80 + "\n")
 
-if script_args.visualize:
-    terminal_visualizer.visualize(outputs.histories, rich=True)
+print("mean_commit_stage_total_tps:",
+      mean_list(outputs.metrics["commit_stage_total_tps"]))
+print("mean_commit_stage_struct_efficiency:",
+      mean_list(outputs.metrics["commit_stage_struct_efficiency"]))
+print("mean_structural_commit_ratio:",
+      mean_list(outputs.metrics["structural_commit_ratio"]))
 
-# --- Example 2: Batch fill-in-the-blanks ---
-print("\n" + "=" * 80)
-print("TEST: llada.infilling()".center(80))
-print("=" * 80)
+total_tokens = len(inputs) * sampler_config.max_new_tokens
 
-masked_messages = [
-    [
-        {"role": "user", "content": tokenizer.mask_token * 20},
-        {
-            "role": "assistant",
-            "content": "Sorry, I do not have answer to this question.",
-        },
-    ],
-    [
-        {"role": "user", "content": "Please write an educational python function."},
-        {
-            "role": "assistant",
-            "content": "def hello_" + tokenizer.mask_token * 20 + " return",
-        },
-    ],
-]
+decode_tps = total_tokens / elapsed
 
-inputs = tokenizer.apply_chat_template(
-    masked_messages,
-    add_generation_prompt=False,
-    tokenize=True,
-)
-
-outputs = sampler.infill(inputs, sampler_config, return_dict=True)
-sequences = dllm.utils.infill_trim(tokenizer, outputs.sequences.tolist(), inputs)
-
-for iter, (i, s) in enumerate(zip(inputs, sequences)):
-    print("\n" + "-" * 80)
-    print(f"[Case {iter}]")
-    print("-" * 80)
-    print("[Masked]:\n" + tokenizer.decode(i))
-    print("-" * 80)
-    print("[Filled]:\n" + (s.strip() if s.strip() else "<empty>"))
-    print("-" * 80)
-    print("[Full]:\n" + tokenizer.decode(outputs.sequences.tolist()[iter]))
-print("\n" + "=" * 80 + "\n")
+print("decode_tps:", decode_tps)
 
 if script_args.visualize:
     terminal_visualizer.visualize(outputs.histories, rich=True)

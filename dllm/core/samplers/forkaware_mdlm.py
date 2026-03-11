@@ -12,7 +12,9 @@ import torch.nn.functional as F
 from dllm.core.samplers.base import BaseSampler, BaseSamplerConfig, BaseSamplerOutput
 from dllm.core.samplers.utils import add_gumbel_noise, get_num_transfer_tokens
 
-from collections import deque
+from collections import deque, Counter
+
+import time
 
 
 @dataclass
@@ -61,6 +63,8 @@ class ForkAwareMDLMSampler(BaseSampler):
 
         self.readiness_map = None
 
+        self.metrics_state = None
+
     def reset_histories(self):
         self.pred_history = {}
         self.branch_history = {}
@@ -79,6 +83,41 @@ class ForkAwareMDLMSampler(BaseSampler):
             dtype=torch.float32,
             device=device,
         )
+
+    def reset_metrics_state(self):
+        self.metrics_state = None
+
+
+    def init_metrics_state(
+        self,
+        batch_size,
+        seq_len,
+        device,
+    ):
+        self.metrics_state = {
+            # efficiency
+            "nfe": 0,
+
+            # commitment
+            "struct_commit_total": torch.zeros(batch_size, dtype=torch.long, device=device),
+            "total_commit_total": torch.zeros(batch_size, dtype=torch.long, device=device),
+            "eligible_total": torch.zeros(batch_size, dtype=torch.long, device=device),
+
+            # scheduler
+            "scheduler_activation_steps": torch.zeros(batch_size, dtype=torch.long, device=device),
+            "scheduler_total_steps": torch.zeros(batch_size, dtype=torch.long, device=device),
+            "ready_coverage_sum": torch.zeros(batch_size, dtype=torch.float32, device=device),
+            "ready_coverage_count": torch.zeros(batch_size, dtype=torch.long, device=device),
+
+            # revisit / remask-like behavior
+            # 统计某位置被多少次纳入 unresolved / candidate refinement 过程
+            "revisit_counts": torch.zeros((batch_size, seq_len), dtype=torch.long, device=device),
+
+            # commit trajectory
+            "commit_trajectory": [[] for _ in range(batch_size)],
+            "commit_phase_time_sum": 0.0,
+            "commit_phase_struct_time_sum": 0.0,
+        }
 
     def compute_ready_mask(
         self,
@@ -178,6 +217,32 @@ class ForkAwareMDLMSampler(BaseSampler):
 
         return entropy + lambda_readiness * self.readiness_map.to(entropy.dtype)
     
+    def update_scheduler_metrics(
+        self,
+        original_candidate_mask,
+        ready_mask,
+        candidate_mask,
+    ):
+        if self.metrics_state is None:
+            return
+
+        B = candidate_mask.shape[0]
+        self.metrics_state["scheduler_total_steps"] += 1
+
+        for j in range(B):
+            final_count = int(candidate_mask[j].sum().item())
+            if final_count == 0:
+                continue
+
+            ready_count = int((candidate_mask[j] & ready_mask[j]).sum().item())
+            coverage = ready_count / final_count
+
+            self.metrics_state["ready_coverage_sum"][j] += float(coverage)
+            self.metrics_state["ready_coverage_count"][j] += 1
+
+            original_count = int(original_candidate_mask[j].sum().item())
+            if final_count < original_count:
+                self.metrics_state["scheduler_activation_steps"][j] += 1
 
     def preselect_candidates(
         self,
@@ -229,6 +294,8 @@ class ForkAwareMDLMSampler(BaseSampler):
             if start < end:
                 candidate_mask[j, start:end] = mask_index[j, start:end]
 
+        original_candidate_mask = candidate_mask.clone()
+
         # ------------------------------------------------------------------
         # Step 3.6: readiness-guided online scheduler (minimal token-level)
         # ------------------------------------------------------------------
@@ -238,17 +305,20 @@ class ForkAwareMDLMSampler(BaseSampler):
                 epsilon_ready=config.epsilon_ready,
             )
 
-            # only keep ready positions inside current block window
             candidate_mask = candidate_mask & ready_mask
 
-            # safety fallback: if scheduler blocks everything for one sample,
-            # fall back to original block-local masked positions
             for j in range(B):
                 if candidate_mask[j].sum() == 0:
                     start = prompt_lens[j] + block_idx * block_size
                     end = min(start + block_size, prompt_lens[j] + max_new_tokens, T)
                     if start < end:
                         candidate_mask[j, start:end] = mask_index[j, start:end]
+
+            self.update_scheduler_metrics(
+                original_candidate_mask=original_candidate_mask,
+                ready_mask=ready_mask,
+                candidate_mask=candidate_mask,
+            )
 
         # Apply candidate mask after scheduler
         masked_entropy = torch.where(
@@ -1031,7 +1101,134 @@ class ForkAwareMDLMSampler(BaseSampler):
 
                     self.readiness_map[j, nxt] += readiness_boost * (readiness_decay ** (d - 1))
     
+    def update_nfe_metric(self):
+        if self.metrics_state is None:
+            return
+        self.metrics_state["nfe"] += 1
+
+    def update_eligible_metric(
+        self,
+        eligible_counts,
+    ):
+        if self.metrics_state is None:
+            return
+        self.metrics_state["eligible_total"] += eligible_counts.to(self.metrics_state["eligible_total"].dtype)
+
+    def update_commit_metrics(
+        self,
+        commit_indices,
+        commit_counts,
+        transfer_index,
+    ):
+        if self.metrics_state is None:
+            return
+
+        self.metrics_state["struct_commit_total"] += commit_counts.to(
+            self.metrics_state["struct_commit_total"].dtype
+        )
+
+        total_commit_counts = transfer_index.sum(dim=-1)
+        self.metrics_state["total_commit_total"] += total_commit_counts.to(
+            self.metrics_state["total_commit_total"].dtype
+        )
+
+        B, K = commit_indices.shape
+        for j in range(B):
+            committed = [int(v) for v in commit_indices[j].tolist() if int(v) >= 0]
+            self.metrics_state["commit_trajectory"][j].append(committed)
+
+    def update_revisit_metrics(
+        self,
+        mask_index,
+    ):
+        if self.metrics_state is None:
+            return
+        self.metrics_state["revisit_counts"] += mask_index.to(
+            self.metrics_state["revisit_counts"].dtype
+        )
+
+    def finalize_metrics(self):
+        if self.metrics_state is None:
+            return {}
+
+        revisit_counts = self.metrics_state["revisit_counts"]
+        avg_revisit = revisit_counts.float().mean(dim=-1)
+        max_revisit = revisit_counts.max(dim=-1).values
+
+        ready_cov_count = self.metrics_state["ready_coverage_count"].clamp_min(1)
+        ready_coverage = self.metrics_state["ready_coverage_sum"] / ready_cov_count.float()
+
+        batch_size = self.metrics_state["total_commit_total"].shape[0]
+
+        commit_phase_time_sum = float(self.metrics_state["commit_phase_time_sum"])
+        latency_commit_phase_per_sample = commit_phase_time_sum / max(batch_size, 1)
+
+        commit_stage_total_tps = (
+            self.metrics_state["total_commit_total"].float()
+            / max(latency_commit_phase_per_sample, 1e-12)
+        )
+
+        commit_stage_struct_efficiency = (
+            self.metrics_state["struct_commit_total"].float()
+            / max(latency_commit_phase_per_sample, 1e-12)
+        )
+
+        structural_commit_ratio = (
+            self.metrics_state["struct_commit_total"].float()
+            / self.metrics_state["total_commit_total"].clamp_min(1).float()
+        )
+
+        metrics = {
+            "nfe": int(self.metrics_state["nfe"]),
+
+            "struct_commit_total": self.metrics_state["struct_commit_total"].tolist(),
+            "total_commit_total": self.metrics_state["total_commit_total"].tolist(),
+            "eligible_total": self.metrics_state["eligible_total"].tolist(),
+
+            "scheduler_activation_steps": self.metrics_state["scheduler_activation_steps"].tolist(),
+            "scheduler_total_steps": self.metrics_state["scheduler_total_steps"].tolist(),
+            "scheduler_activation_rate": (
+                self.metrics_state["scheduler_activation_steps"].float()
+                / self.metrics_state["scheduler_total_steps"].clamp_min(1).float()
+            ).tolist(),
+
+            "ready_coverage": ready_coverage.tolist(),
+
+            "avg_revisit": avg_revisit.tolist(),
+            "max_revisit": max_revisit.tolist(),
+
+            "commit_trajectory": self.metrics_state["commit_trajectory"],
+
+            "commit_phase_time_sum": commit_phase_time_sum,
+            "latency_commit_phase_per_sample": latency_commit_phase_per_sample,
+
+            "commit_stage_total_tps": commit_stage_total_tps.tolist(),
+            "commit_stage_struct_efficiency": commit_stage_struct_efficiency.tolist(),
+            "structural_commit_ratio": structural_commit_ratio.tolist(),
+        }
+        return metrics
     
+    def compute_jump_entropy(self, commit_steps):
+        positions = []
+        for step in commit_steps:
+            for pos in step:
+                if pos >= 0:
+                    positions.append(int(pos))
+
+        if len(positions) <= 2:
+            return 0.0
+
+        jumps = [abs(positions[i] - positions[i - 1]) for i in range(1, len(positions))]
+        counter = Counter(jumps)
+        total = sum(counter.values())
+        probs = [c / total for c in counter.values()]
+
+        entropy = -sum(p * math.log(p + 1e-12) for p in probs)
+        k = len(counter)
+        if k <= 1:
+            return 0.0
+        return entropy / math.log(k + 1e-12)
+
     @torch.no_grad()
     def sample(
         self,
@@ -1055,6 +1252,7 @@ class ForkAwareMDLMSampler(BaseSampler):
         """
         self.reset_histories()
         self.reset_scheduler_state()
+        self.reset_metrics_state()
 
         if config is None:
             config = ForkAwareMDLMSamplerConfig()
@@ -1140,6 +1338,13 @@ class ForkAwareMDLMSampler(BaseSampler):
                 device=x.device,
             )
 
+        if self.metrics_state is None:
+            self.init_metrics_state(
+                batch_size=x.shape[0],
+                seq_len=x.shape[1],
+                device=x.device,
+            )
+
         for b in range(num_blocks):
             # Build a per-sample mask *within this block* (aligned to each prompt's tail)
             block_mask_index = torch.zeros(
@@ -1177,6 +1382,12 @@ class ForkAwareMDLMSampler(BaseSampler):
                     suppress_tokens=suppress_tokens,
                     begin_suppress_tokens=begin_suppress_tokens,
                     right_shift_logits=right_shift_logits,
+                )
+
+                self.update_nfe_metric()
+
+                self.update_revisit_metrics(
+                    mask_index=mask_index,
                 )
 
                 self.update_prediction_history(
@@ -1276,6 +1487,10 @@ class ForkAwareMDLMSampler(BaseSampler):
                     eligible_mask=eligible_mask,
                 )
 
+                self.update_eligible_metric(
+                    eligible_counts=eligible_counts,
+                )
+
                 confidence_scores = self.compute_candidate_confidence(
                     logits=logits,
                     eligible_indices=eligible_indices,
@@ -1323,6 +1538,8 @@ class ForkAwareMDLMSampler(BaseSampler):
                 # Step 7.5 / 7.6: integrate 3.4 commit_indices into real transfer logic
                 # ------------------------------------------------------------------
 
+                commit_phase_start = time.time()
+
                 # Convert [B, K] commit_indices -> [B, T] bool mask
                 commit_transfer_mask, commit_counts = self.commit_indices_to_mask(
                     commit_indices=commit_indices,
@@ -1365,6 +1582,15 @@ class ForkAwareMDLMSampler(BaseSampler):
                 # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
 
+                commit_phase_end = time.time()
+                self.metrics_state["commit_phase_time_sum"] += (commit_phase_end - commit_phase_start)
+
+                self.update_commit_metrics(
+                    commit_indices=commit_indices,
+                    commit_counts=commit_counts,
+                    transfer_index=transfer_index,
+                )
+
                 self.update_readiness_from_commits(
                     commit_indices=commit_indices,
                     mask_index=mask_index,
@@ -1376,11 +1602,29 @@ class ForkAwareMDLMSampler(BaseSampler):
                 if histories is not None:
                     histories.append(x.clone())
 
+        metrics = self.finalize_metrics()
+
+        commit_traj = metrics["commit_trajectory"]
+
+        jump_distances = [
+            self.compute_jump_entropy(traj)
+            for traj in commit_traj
+        ]
+
+        print("\n[Average Jump Distance]")
+
+        for i, j in enumerate(jump_distances):
+            print(f"sample {i}: {j:.2f}")
+
+        print("mean:", sum(jump_distances) / len(jump_distances))
+
         # ----- Output format -----
         if not return_dict:
             return x
         else:
-            return BaseSamplerOutput(sequences=x, histories=histories)
+            output = BaseSamplerOutput(sequences=x, histories=histories)
+            output.metrics = metrics
+            return output
 
     @torch.no_grad()
     def infill(

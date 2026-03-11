@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from dllm.core.samplers.base import BaseSampler, BaseSamplerConfig, BaseSamplerOutput
 from dllm.core.samplers.utils import add_gumbel_noise, get_num_transfer_tokens
 
+import time
+
 
 @dataclass
 class MDLMSamplerConfig(BaseSamplerConfig):
@@ -33,6 +35,62 @@ class MDLMSamplerConfig(BaseSamplerConfig):
 
 @dataclass
 class MDLMSampler(BaseSampler):
+    def init_metrics_state(self, batch_size, device):
+        self.metrics_state = {
+            "commit_phase_time_sum": 0.0,
+            "total_commit_total": torch.zeros(batch_size, dtype=torch.long, device=device),
+            "struct_commit_total": torch.zeros(batch_size, dtype=torch.long, device=device),
+            "nfe": 0,
+        }
+
+
+    def update_nfe_metric(self):
+        self.metrics_state["nfe"] += 1
+
+
+    def update_commit_metrics(self, transfer_index):
+        total_commit_counts = transfer_index.sum(dim=-1)
+        self.metrics_state["total_commit_total"] += total_commit_counts.to(
+            self.metrics_state["total_commit_total"].dtype
+        )
+
+        # Plain MDLM has no structural commit branch
+        # Keep it zero for compatible logging
+        self.metrics_state["struct_commit_total"] += 0
+
+
+    def finalize_metrics(self):
+        batch_size = self.metrics_state["total_commit_total"].shape[0]
+
+        commit_phase_time_sum = float(self.metrics_state["commit_phase_time_sum"])
+        latency_commit_phase_per_sample = commit_phase_time_sum / max(batch_size, 1)
+
+        commit_stage_total_tps = (
+            self.metrics_state["total_commit_total"].float()
+            / max(latency_commit_phase_per_sample, 1e-12)
+        )
+
+        commit_stage_struct_efficiency = (
+            self.metrics_state["struct_commit_total"].float()
+            / max(latency_commit_phase_per_sample, 1e-12)
+        )
+
+        structural_commit_ratio = (
+            self.metrics_state["struct_commit_total"].float()
+            / self.metrics_state["total_commit_total"].clamp_min(1).float()
+        )
+
+        return {
+            "nfe": [int(self.metrics_state["nfe"])] * batch_size,
+            "commit_phase_time_sum": commit_phase_time_sum,
+            "latency_commit_phase_per_sample": latency_commit_phase_per_sample,
+            "total_commit_total": self.metrics_state["total_commit_total"].tolist(),
+            "struct_commit_total": self.metrics_state["struct_commit_total"].tolist(),
+            "commit_stage_total_tps": commit_stage_total_tps.tolist(),
+            "commit_stage_struct_efficiency": commit_stage_struct_efficiency.tolist(),
+            "structural_commit_ratio": structural_commit_ratio.tolist(),
+        }
+    
     @torch.no_grad()
     def sample(
         self,
@@ -103,6 +161,8 @@ class MDLMSampler(BaseSampler):
 
         B = len(inputs)
         T = max_length
+
+        self.init_metrics_state(batch_size=B, device=self.model.device)
 
         # ----- Initialize canvas with EOS, copy inputs, and append mask tail -----
         x = torch.full((B, T), eos_id, dtype=torch.long, device=self.model.device)
@@ -176,6 +236,8 @@ class MDLMSampler(BaseSampler):
                         x, attention_mask=attention_mask
                     ).logits  # Use attention mask here
 
+                self.update_nfe_metric()
+
                 if suppress_tokens is not None and len(suppress_tokens) > 0:
                     for token_id in suppress_tokens:
                         logits[:, :, token_id] = -torch.inf
@@ -216,6 +278,8 @@ class MDLMSampler(BaseSampler):
                     mask_index, x0_p, -np.inf
                 )  # consider masked positions only
 
+                commit_phase_start = time.time()
+
                 # Pick exactly `num_transfer_tokens[j, i]` highest-confidence positions per sample
                 transfer_index = torch.zeros_like(
                     x0, dtype=torch.bool, device=x0.device
@@ -228,14 +292,26 @@ class MDLMSampler(BaseSampler):
 
                 # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
+
+                commit_phase_end = time.time()
+                self.metrics_state["commit_phase_time_sum"] += (commit_phase_end - commit_phase_start)
+
+                self.update_commit_metrics(
+                    transfer_index=transfer_index,
+                )
+
                 if histories is not None:
                     histories.append(x.clone())
 
+        metrics = self.finalize_metrics()
+        
         # ----- Output format -----
         if not return_dict:
             return x
         else:
-            return BaseSamplerOutput(sequences=x, histories=histories)
+            output = BaseSamplerOutput(sequences=x, histories=histories)
+            output.metrics = metrics
+            return output
 
     @torch.no_grad()
     def infill(
