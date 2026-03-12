@@ -109,9 +109,7 @@ class ForkAwareMDLMSampler(BaseSampler):
             "ready_coverage_sum": torch.zeros(batch_size, dtype=torch.float32, device=device),
             "ready_coverage_count": torch.zeros(batch_size, dtype=torch.long, device=device),
 
-            # revisit / remask-like behavior
-            # 统计某位置被多少次纳入 unresolved / candidate refinement 过程
-            "revisit_counts": torch.zeros((batch_size, seq_len), dtype=torch.long, device=device),
+            "attempt_counts": torch.zeros((batch_size, seq_len), dtype=torch.long, device=device),
 
             # commit trajectory
             "commit_trajectory": [[] for _ in range(batch_size)],
@@ -339,6 +337,17 @@ class ForkAwareMDLMSampler(BaseSampler):
         candidate_scores, candidate_indices = torch.topk(masked_entropy, k=k, dim=1)
 
         return candidate_indices, candidate_scores
+    
+    def update_attempt_metrics(self, candidate_indices):
+        if self.metrics_state is None:
+            return
+
+        B, K = candidate_indices.shape
+        for j in range(B):
+            for pos in candidate_indices[j].tolist():
+                pos = int(pos)
+                if pos >= 0:
+                    self.metrics_state["attempt_counts"][j, pos] += 1
     
     def distribution_distance(
         self,
@@ -1137,23 +1146,9 @@ class ForkAwareMDLMSampler(BaseSampler):
             committed = [int(v) for v in commit_indices[j].tolist() if int(v) >= 0]
             self.metrics_state["commit_trajectory"][j].append(committed)
 
-    def update_revisit_metrics(
-        self,
-        mask_index,
-    ):
-        if self.metrics_state is None:
-            return
-        self.metrics_state["revisit_counts"] += mask_index.to(
-            self.metrics_state["revisit_counts"].dtype
-        )
-
     def finalize_metrics(self):
         if self.metrics_state is None:
             return {}
-
-        revisit_counts = self.metrics_state["revisit_counts"]
-        avg_revisit = revisit_counts.float().mean(dim=-1)
-        max_revisit = revisit_counts.max(dim=-1).values
 
         ready_cov_count = self.metrics_state["ready_coverage_count"].clamp_min(1)
         ready_coverage = self.metrics_state["ready_coverage_sum"] / ready_cov_count.float()
@@ -1178,6 +1173,10 @@ class ForkAwareMDLMSampler(BaseSampler):
             / self.metrics_state["total_commit_total"].clamp_min(1).float()
         )
 
+        attempt_counts = self.metrics_state["attempt_counts"]
+        avg_attempt = attempt_counts.float().mean(dim=-1)
+        max_attempt = attempt_counts.max(dim=-1).values
+
         metrics = {
             "nfe": int(self.metrics_state["nfe"]),
 
@@ -1194,8 +1193,8 @@ class ForkAwareMDLMSampler(BaseSampler):
 
             "ready_coverage": ready_coverage.tolist(),
 
-            "avg_revisit": avg_revisit.tolist(),
-            "max_revisit": max_revisit.tolist(),
+            "avg_attempt": avg_attempt.tolist(),
+            "max_attempt": max_attempt.tolist(),
 
             "commit_trajectory": self.metrics_state["commit_trajectory"],
 
@@ -1386,10 +1385,6 @@ class ForkAwareMDLMSampler(BaseSampler):
 
                 self.update_nfe_metric()
 
-                self.update_revisit_metrics(
-                    mask_index=mask_index,
-                )
-
                 self.update_prediction_history(
                     x0=x0,
                     mask_index=mask_index,
@@ -1406,6 +1401,8 @@ class ForkAwareMDLMSampler(BaseSampler):
                     top_m=config.probe_top_m,
                     config=config,
                 )
+
+                self.update_attempt_metrics(candidate_indices=candidate_indices)
 
                 i_down_scores = self.estimate_downstream_influence(
                     x=x,

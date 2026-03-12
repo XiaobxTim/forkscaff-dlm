@@ -35,18 +35,33 @@ class MDLMSamplerConfig(BaseSamplerConfig):
 
 @dataclass
 class MDLMSampler(BaseSampler):
-    def init_metrics_state(self, batch_size, device):
+    def init_metrics_state(self, batch_size, seq_len, device):
         self.metrics_state = {
             "commit_phase_time_sum": 0.0,
             "total_commit_total": torch.zeros(batch_size, dtype=torch.long, device=device),
             "struct_commit_total": torch.zeros(batch_size, dtype=torch.long, device=device),
             "nfe": 0,
+
+            "attempt_counts": torch.zeros((batch_size, seq_len), dtype=torch.long, device=device),
+
+            # commit trace
+            "commit_trajectory": [[] for _ in range(batch_size)],
         }
 
 
     def update_nfe_metric(self):
         self.metrics_state["nfe"] += 1
 
+    def update_attempt_metrics(self, candidate_indices):
+        if self.metrics_state is None:
+            return
+
+        B, K = candidate_indices.shape
+        for j in range(B):
+            for pos in candidate_indices[j].tolist():
+                pos = int(pos)
+                if pos >= 0:
+                    self.metrics_state["attempt_counts"][j, pos] += 1
 
     def update_commit_metrics(self, transfer_index):
         total_commit_counts = transfer_index.sum(dim=-1)
@@ -54,9 +69,56 @@ class MDLMSampler(BaseSampler):
             self.metrics_state["total_commit_total"].dtype
         )
 
-        # Plain MDLM has no structural commit branch
-        # Keep it zero for compatible logging
+        # baseline MDLM has no structural commit branch
         self.metrics_state["struct_commit_total"] += 0
+
+        batch_size = transfer_index.shape[0]
+        for j in range(batch_size):
+            committed = torch.nonzero(
+                transfer_index[j], as_tuple=False
+            ).squeeze(-1).tolist()
+            self.metrics_state["commit_trajectory"][j].append(committed)
+
+    def preselect_candidates_baseline(
+        self,
+        confidence,
+        mask_index,
+        prompt_lens,
+        block_idx,
+        block_size,
+        max_new_tokens,
+        top_m,
+    ):
+        """
+        Build a baseline candidate pool using top-m confidence positions
+        inside the current block and current masked region.
+        """
+        B, T = confidence.shape
+        candidate_mask = torch.zeros_like(mask_index, dtype=torch.bool)
+
+        for j in range(B):
+            start = prompt_lens[j] + block_idx * block_size
+            end = min(start + block_size, prompt_lens[j] + max_new_tokens, T)
+            if start < end:
+                candidate_mask[j, start:end] = mask_index[j, start:end]
+
+        masked_conf = torch.where(
+            candidate_mask,
+            confidence,
+            torch.full_like(confidence, float("-inf")),
+        )
+
+        valid_counts = candidate_mask.sum(dim=1)
+        max_k = int(valid_counts.max().item()) if valid_counts.numel() > 0 else 0
+        k = min(top_m, max_k)
+
+        if k == 0:
+            empty_idx = torch.empty((B, 0), dtype=torch.long, device=confidence.device)
+            empty_scores = torch.empty((B, 0), dtype=confidence.dtype, device=confidence.device)
+            return empty_idx, empty_scores
+
+        candidate_scores, candidate_indices = torch.topk(masked_conf, k=k, dim=1)
+        return candidate_indices, candidate_scores
 
 
     def finalize_metrics(self):
@@ -80,6 +142,10 @@ class MDLMSampler(BaseSampler):
             / self.metrics_state["total_commit_total"].clamp_min(1).float()
         )
 
+        attempt_counts = self.metrics_state["attempt_counts"]
+        avg_attempt = attempt_counts.float().mean(dim=-1)
+        max_attempt = attempt_counts.max(dim=-1).values
+
         return {
             "nfe": [int(self.metrics_state["nfe"])] * batch_size,
             "commit_phase_time_sum": commit_phase_time_sum,
@@ -89,7 +155,26 @@ class MDLMSampler(BaseSampler):
             "commit_stage_total_tps": commit_stage_total_tps.tolist(),
             "commit_stage_struct_efficiency": commit_stage_struct_efficiency.tolist(),
             "structural_commit_ratio": structural_commit_ratio.tolist(),
+            "avg_attempt": avg_attempt.tolist(),
+            "max_attempt": max_attempt.tolist(),
+            "commit_trajectory": self.metrics_state["commit_trajectory"],
         }
+    
+    def compute_avg_jump_distance(self, commit_steps):
+        positions = []
+        for step in commit_steps:
+            for pos in step:
+                if pos >= 0:
+                    positions.append(int(pos))
+
+        if len(positions) <= 1:
+            return 0.0
+
+        jumps = [
+            abs(positions[i] - positions[i - 1])
+            for i in range(1, len(positions))
+        ]
+        return sum(jumps) / len(jumps)
     
     @torch.no_grad()
     def sample(
@@ -162,7 +247,7 @@ class MDLMSampler(BaseSampler):
         B = len(inputs)
         T = max_length
 
-        self.init_metrics_state(batch_size=B, device=self.model.device)
+        self.init_metrics_state(batch_size=B, seq_len=T, device=self.model.device)
 
         # ----- Initialize canvas with EOS, copy inputs, and append mask tail -----
         x = torch.full((B, T), eos_id, dtype=torch.long, device=self.model.device)
@@ -278,6 +363,20 @@ class MDLMSampler(BaseSampler):
                     mask_index, x0_p, -np.inf
                 )  # consider masked positions only
 
+                candidate_indices, candidate_scores = self.preselect_candidates_baseline(
+                    confidence=confidence,
+                    mask_index=mask_index,
+                    prompt_lens=prompt_lens,
+                    block_idx=b,
+                    block_size=block_size,
+                    max_new_tokens=max_new_tokens,
+                    top_m=block_size,   # 或者单独设一个 config.probe_top_m
+                )
+
+                self.update_attempt_metrics(
+                    candidate_indices=candidate_indices,
+                )
+
                 commit_phase_start = time.time()
 
                 # Pick exactly `num_transfer_tokens[j, i]` highest-confidence positions per sample
@@ -304,6 +403,11 @@ class MDLMSampler(BaseSampler):
                     histories.append(x.clone())
 
         metrics = self.finalize_metrics()
+
+        commit_traj = metrics["commit_trajectory"]
+
+        avg_jumps = [self.compute_avg_jump_distance(t) for t in commit_traj]
+        print("mean_avg_jump_distance:", sum(avg_jumps) / len(avg_jumps))
         
         # ----- Output format -----
         if not return_dict:

@@ -10,6 +10,8 @@ import dllm
 
 import time
 
+import torch
+
 
 @dataclass
 class ScriptArguments:
@@ -43,6 +45,40 @@ def print_metrics(title, outputs):
 
 def mean_list(xs):
     return sum(xs) / len(xs)
+
+def compute_stable_ratio_gen(histories, prompt_lens, max_new_tokens):
+    """
+    histories: list of [B, T] tensors, one per decoding step
+    prompt_lens: list[int]
+    max_new_tokens: int
+
+    Returns:
+        stable_ratios: list[float] for each sample
+    """
+    if len(histories) <= 1:
+        B = histories[0].shape[0]
+        return [1.0] * B
+
+    H = torch.stack(histories, dim=0)  # [S, B, T]
+    S, B, T = H.shape
+
+    stable_ratios = []
+
+    for j in range(B):
+        start = prompt_lens[j]
+        end = min(prompt_lens[j] + max_new_tokens, T)
+
+        if end <= start:
+            stable_ratios.append(1.0)
+            continue
+
+        # compare adjacent steps only on generation region
+        same = (H[1:, j, start:end] == H[:-1, j, start:end]).float()
+
+        ratio = same.mean().item()
+        stable_ratios.append(ratio)
+
+    return stable_ratios
 
 parser = transformers.HfArgumentParser((ScriptArguments, SamplerConfig))
 script_args, sampler_config = parser.parse_args_into_dataclasses()
@@ -92,6 +128,18 @@ print("mean_commit_stage_struct_efficiency:",
       mean_list(outputs.metrics["commit_stage_struct_efficiency"]))
 print("mean_structural_commit_ratio:",
       mean_list(outputs.metrics["structural_commit_ratio"]))
+print("mean_avg_attempt:",
+      mean_list(outputs.metrics["avg_attempt"]))
+print("mean_max_attempt:",
+      mean_list(outputs.metrics["max_attempt"]))
+
+stable_ratios = compute_stable_ratio_gen(
+    histories=outputs.histories,
+    prompt_lens=[len(x) for x in inputs],
+    max_new_tokens=sampler_config.max_new_tokens,
+)
+
+print("mean_stable_ratio:", sum(stable_ratios) / len(stable_ratios))
 
 total_tokens = len(inputs) * sampler_config.max_new_tokens
 

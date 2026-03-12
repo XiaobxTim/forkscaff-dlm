@@ -91,10 +91,10 @@ print("mean_commit_stage_struct_efficiency:",
       mean_list(outputs.metrics["commit_stage_struct_efficiency"]))
 print("mean_structural_commit_ratio:",
       mean_list(outputs.metrics["structural_commit_ratio"]))
-print("mean_avg_revisit:",
-      mean_list(outputs.metrics["avg_revisit"]))
-print("mean_max_revisit:",
-      mean_list(outputs.metrics["max_revisit"]))
+print("mean_avg_attempt:",
+      mean_list(outputs.metrics["avg_attempt"]))
+print("mean_max_attempt:",
+      mean_list(outputs.metrics["max_attempt"]))
 print("mean_ready_coverage:",
       mean_list(outputs.metrics["ready_coverage"]))
 print("mean_scheduler_activation_rate:",
