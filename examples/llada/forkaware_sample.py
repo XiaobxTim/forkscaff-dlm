@@ -100,11 +100,62 @@ print("mean_ready_coverage:",
 print("mean_scheduler_activation_rate:",
       mean_list(outputs.metrics["scheduler_activation_rate"]))
 
-total_tokens = len(inputs) * sampler_config.max_new_tokens
+generated_token_counts = [
+    len(tokenizer.encode(s, add_special_tokens=False))
+    for s in sequences
+]
+total_generated_tokens = sum(generated_token_counts)
 
-decode_tps = total_tokens / elapsed
-
+decode_tps = total_generated_tokens / elapsed
+print("total_generated_tokens:", total_generated_tokens)
 print("decode_tps:", decode_tps)
+
+def extract_first_unmask_order(histories, tokenizer, mask_token_id):
+    """
+    histories: list[Tensor], each [B, T]
+    returns:
+        results[b] = [(step, pos, token_id, token_str), ...] sorted by first unmask step
+    """
+    if histories is None or len(histories) <= 1:
+        return []
+
+    B, T = histories[0].shape
+    results = [[] for _ in range(B)]
+    first_seen = [dict() for _ in range(B)]
+
+    for t in range(1, len(histories)):
+        prev_state = histories[t - 1]
+        curr_state = histories[t]
+
+        for b in range(B):
+            changed = (prev_state[b] != curr_state[b]).nonzero(as_tuple=False).squeeze(-1)
+
+            for pos in changed.tolist():
+                prev_id = int(prev_state[b, pos].item())
+                curr_id = int(curr_state[b, pos].item())
+
+                # 只统计从 mask -> token 的首次变化
+                if prev_id == mask_token_id and curr_id != mask_token_id:
+                    if pos not in first_seen[b]:
+                        token_str = tokenizer.decode([curr_id])
+                        first_seen[b][pos] = (t, pos, curr_id, token_str)
+
+    for b in range(B):
+        results[b] = sorted(first_seen[b].values(), key=lambda x: x[0])
+
+    return results
+
+mask_token_id = tokenizer.mask_token_id
+first_orders = extract_first_unmask_order(
+    histories=outputs.histories,
+    tokenizer=tokenizer,
+    mask_token_id=mask_token_id,
+)
+
+for sample_id, order in enumerate(first_orders):
+    print(f"\n===== Sample {sample_id} First-Unmask Order =====")
+    for step, pos, token_id, token_str in order:
+        print(f"step {step:3d} | pos {pos:3d} | token {repr(token_str)}")
 
 if script_args.visualize:
     terminal_visualizer.visualize(outputs.histories, rich=True)

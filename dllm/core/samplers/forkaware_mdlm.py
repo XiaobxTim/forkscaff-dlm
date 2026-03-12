@@ -12,9 +12,14 @@ import torch.nn.functional as F
 from dllm.core.samplers.base import BaseSampler, BaseSamplerConfig, BaseSamplerOutput
 from dllm.core.samplers.utils import add_gumbel_noise, get_num_transfer_tokens
 
-from collections import deque, Counter
+from collections import deque, Counter, defaultdict
 
 import time
+
+def _sync_time():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.time()
 
 
 @dataclass
@@ -33,10 +38,13 @@ class ForkAwareMDLMSamplerConfig(BaseSamplerConfig):
     suppress_tokens: list[int] | None = None
     begin_suppress_tokens: list[int] | None = None
     right_shift_logits: bool = False
-    probe_top_m: int = 16
+    downstream_window: int = 16
+    probe_top_m: int = 4
+    downstream_top_r: int = 2
     probe_divergence: str = "js"
-    structural_top_k: int = 4
-    branch_top_k_values: int = 2   # 最小版只用 top-2
+    structural_top_k: int = 2
+    branch_top_k_values: int = 1   # 最小版只用 top-1
+    probe_interval: int = 8
     alpha_struct: float = 1.0      # I_down 权重
     beta_branch: float = 0.5       # I_branch 权重
     consistency_window: int = 4
@@ -400,6 +408,67 @@ class ForkAwareMDLMSampler(BaseSampler):
                 block_mask[j, start:end] = mask_index[j, start:end]
 
         return block_mask
+
+    def get_local_downstream_indices(
+        self,
+        block_mask_row: torch.Tensor,
+        candidate_pos: int,
+        window: int,
+    ) -> torch.Tensor:
+        """
+        Select a local unresolved neighborhood for downstream influence.
+        We only keep the nearest `window` masked positions after candidate_pos.
+        """
+        masked_pos = torch.nonzero(block_mask_row, as_tuple=False).squeeze(-1)
+    
+        if masked_pos.numel() == 0:
+            return masked_pos
+    
+        future_pos = masked_pos[masked_pos > candidate_pos]
+    
+        if future_pos.numel() == 0:
+            return future_pos
+    
+        return future_pos[:window]
+
+    def select_downstream_candidates(
+        self,
+        candidate_indices: torch.Tensor,   # [B, K]
+        candidate_scores: torch.Tensor,    # [B, K]
+        top_r: int,
+    ):
+        """
+        Select a small subset of candidates for downstream probing.
+        Assumes larger candidate_scores means higher priority.
+        Returns:
+            selected_indices: [B, R]
+            selected_pos: [B, R] positions in the original candidate list
+        """
+        B, K = candidate_indices.shape
+        R = min(top_r, K)
+    
+        top_vals, top_pos = torch.topk(candidate_scores, k=R, dim=-1)
+        selected_indices = torch.gather(candidate_indices, dim=1, index=top_pos)
+    
+        return selected_indices, top_pos
+
+    def scatter_downstream_scores(
+        self,
+        small_scores: torch.Tensor,   # [B, R]
+        selected_pos: torch.Tensor,   # [B, R]
+        full_k: int,
+    ):
+        """
+        Scatter downstream scores back to [B, K], filling unselected positions with 0.
+        """
+        B, R = small_scores.shape
+        full_scores = torch.zeros(
+            (B, full_k),
+            dtype=small_scores.dtype,
+            device=small_scores.device,
+        )
+        full_scores.scatter_(dim=1, index=selected_pos, src=small_scores)
+        return full_scores
         
     def estimate_downstream_influence(
         self,
@@ -418,30 +487,33 @@ class ForkAwareMDLMSampler(BaseSampler):
         begin_suppress_tokens=None,
         right_shift_logits=False,
         divergence_mode="l1",
+        downstream_window=16,
     ):
         """
-        对每个 candidate position s，做一次 top-1 hypothetical commit，
-        重新 forward，并计算它对当前 block 内其他 masked positions 的平均分布影响。
-
+        For each candidate position s, perform one top-1 hypothetical commit,
+        re-run forward, and measure its average distributional effect on a LOCAL
+        unresolved neighborhood in the current block.
+    
         Args:
             x: [B, T]
             attention_mask: [B, T]
-            logits: [B, T, V]   当前 base logits
+            logits: [B, T, V] current base logits
             candidate_indices: [B, K]
             mask_index: [B, T] bool
             prompt_lens: list[int]
-            block_idx, block_size, max_new_tokens: 当前 block 信息
-
+            block_idx, block_size, max_new_tokens: current block info
+            downstream_window: number of nearby unresolved positions to inspect
+    
         Returns:
             influence_scores: [B, K]
         """
         B, T, V = logits.shape
         K = candidate_indices.shape[1]
-
+    
         # base probs
         base_probs = F.softmax(logits, dim=-1)  # [B, T, V]
-
-        # 当前 block 内仍 masked 的位置
+    
+        # masked positions in the current block
         block_mask = self.get_block_candidate_mask(
             mask_index=mask_index,
             prompt_lens=prompt_lens,
@@ -449,32 +521,32 @@ class ForkAwareMDLMSampler(BaseSampler):
             block_size=block_size,
             max_new_tokens=max_new_tokens,
         )  # [B, T]
-
-        # 候选位置的 top-1 token，作为 hypothetical commit
+    
+        # top-1 hypothetical commit token
         top1_tokens = torch.argmax(logits, dim=-1)  # [B, T]
-
+    
         influence_scores = torch.zeros(
             (B, K), dtype=logits.dtype, device=logits.device
         )
-
+    
         for j in range(B):
             for k in range(K):
                 s = int(candidate_indices[j, k].item())
-
-                # 如果这个位置不是有效 mask，直接记 0
+    
+                # invalid or already unmasked
                 if not (0 <= s < T) or not bool(mask_index[j, s].item()):
                     influence_scores[j, k] = 0.0
                     continue
-
-                # 构造 counterfactual x_cf
+    
+                # build counterfactual input
                 x_cf = x.clone()
                 x_cf[j, s] = top1_tokens[j, s]
-
-                # 重新 forward
+    
+                # counterfactual forward
                 cf_logits, _, cf_mask_index = self.get_step_state(
                     x=x_cf,
                     attention_mask=attention_mask,
-                    temperature=0.0,  # 这里只需要稳定分布，不要噪声
+                    temperature=0.0,
                     cfg_scale=cfg_scale,
                     unmasked_index=unmasked_index,
                     suppress_tokens=suppress_tokens,
@@ -482,28 +554,29 @@ class ForkAwareMDLMSampler(BaseSampler):
                     right_shift_logits=right_shift_logits,
                 )
                 cf_probs = F.softmax(cf_logits, dim=-1)  # [B, T, V]
-
-                # 只看 sample j 当前 block 内“其他”仍 masked 的位置
-                target_mask = block_mask[j].clone()  # [T]
-                target_mask[s] = False  # 不比较自己
-
-                target_indices = torch.nonzero(target_mask, as_tuple=False).squeeze(-1)
-
+    
+                # local unresolved neighborhood after s
+                target_indices = self.get_local_downstream_indices(
+                    block_mask_row=block_mask[j],
+                    candidate_pos=s,
+                    window=downstream_window,
+                )
+    
                 if target_indices.numel() == 0:
                     influence_scores[j, k] = 0.0
                     continue
-
+    
                 p_base = base_probs[j, target_indices, :]  # [N, V]
                 p_cf = cf_probs[j, target_indices, :]      # [N, V]
-
+    
                 dist = self.distribution_distance(
                     p_base,
                     p_cf,
                     mode=divergence_mode,
                 )  # [N]
-
+    
                 influence_scores[j, k] = dist.mean()
-
+    
         return influence_scores
     
     def get_topk_candidate_values(
@@ -551,22 +624,23 @@ class ForkAwareMDLMSampler(BaseSampler):
         right_shift_logits=False,
         divergence_mode="l1",
         top_k_values=2,
+        branch_window=16,
     ):
         """
-        对每个 candidate position s：
-        取 top-2 plausible values，分别做两次 hypothetical commit，
-        比较两种 commit 对当前 block 内其他 masked positions 的未来分布差异。
-
-        返回:
+        For each candidate position s:
+        take top-2 plausible values, perform two hypothetical commits,
+        and compare the difference they induce on a LOCAL unresolved neighborhood.
+    
+        Returns:
             branch_scores: [B, K]
         """
         B, T, V = logits.shape
         K = candidate_indices.shape[1]
-
+    
         if K == 0:
             return torch.empty((B, 0), dtype=logits.dtype, device=logits.device)
-
-        # 当前 block 内仍 masked 的位置
+    
+        # masked positions in the current block
         block_mask = self.get_block_candidate_mask(
             mask_index=mask_index,
             prompt_lens=prompt_lens,
@@ -574,36 +648,36 @@ class ForkAwareMDLMSampler(BaseSampler):
             block_size=block_size,
             max_new_tokens=max_new_tokens,
         )  # [B, T]
-
-        # 每个 candidate 的 top-2 plausible values
+    
+        # top-2 plausible values for each candidate
         topk_token_ids = self.get_topk_candidate_values(
             logits=logits,
             candidate_indices=candidate_indices,
             top_k_values=top_k_values,
         )  # [B, K, 2]
-
+    
         branch_scores = torch.zeros((B, K), dtype=logits.dtype, device=logits.device)
-
+    
         for j in range(B):
             for k in range(K):
                 s = int(candidate_indices[j, k].item())
-
+    
                 if not (0 <= s < T) or not bool(mask_index[j, s].item()):
                     branch_scores[j, k] = 0.0
                     continue
-
+    
                 if top_k_values < 2:
                     branch_scores[j, k] = 0.0
                     continue
-
+    
                 v1 = int(topk_token_ids[j, k, 0].item())
                 v2 = int(topk_token_ids[j, k, 1].item())
-
-                # 如果 top-2 恰好一样，直接记 0
+    
+                # if top-2 collapse to the same token, no branch difference
                 if v1 == v2:
                     branch_scores[j, k] = 0.0
                     continue
-
+    
                 # counterfactual #1
                 x_cf1 = x.clone()
                 x_cf1[j, s] = v1
@@ -618,7 +692,7 @@ class ForkAwareMDLMSampler(BaseSampler):
                     right_shift_logits=right_shift_logits,
                 )
                 cf1_probs = F.softmax(cf1_logits, dim=-1)
-
+    
                 # counterfactual #2
                 x_cf2 = x.clone()
                 x_cf2[j, s] = v2
@@ -633,27 +707,29 @@ class ForkAwareMDLMSampler(BaseSampler):
                     right_shift_logits=right_shift_logits,
                 )
                 cf2_probs = F.softmax(cf2_logits, dim=-1)
-
-                # 只看 sample j 当前 block 内“其他”仍 masked 的位置
-                target_mask = block_mask[j].clone()
-                target_mask[s] = False
-                target_indices = torch.nonzero(target_mask, as_tuple=False).squeeze(-1)
-
+    
+                # local unresolved neighborhood after s
+                target_indices = self.get_local_downstream_indices(
+                    block_mask_row=block_mask[j],
+                    candidate_pos=s,
+                    window=branch_window,
+                )
+    
                 if target_indices.numel() == 0:
                     branch_scores[j, k] = 0.0
                     continue
-
+    
                 p1 = cf1_probs[j, target_indices, :]   # [N, V]
                 p2 = cf2_probs[j, target_indices, :]   # [N, V]
-
+    
                 dist = self.distribution_distance(
                     p1,
                     p2,
                     mode=divergence_mode,
                 )  # [N]
-
+    
                 branch_scores[j, k] = dist.mean()
-
+    
         return branch_scores
     
     def get_branch_plausibility_weight(
@@ -1207,26 +1283,35 @@ class ForkAwareMDLMSampler(BaseSampler):
         }
         return metrics
     
-    def compute_jump_entropy(self, commit_steps):
-        positions = []
+    def extract_effective_positions(self, commit_steps):
+        """
+        Flatten commit trajectory and remove consecutive duplicates.
+        Empty steps are ignored.
+        """
+        raw_positions = []
         for step in commit_steps:
             for pos in step:
                 if pos >= 0:
-                    positions.append(int(pos))
+                    raw_positions.append(int(pos))
+    
+        if not raw_positions:
+            return []
+    
+        effective_positions = [raw_positions[0]]
+        for pos in raw_positions[1:]:
+            if pos != effective_positions[-1]:
+                effective_positions.append(pos)
+    
+        return effective_positions
 
-        if len(positions) <= 2:
+    def compute_effective_jump_distance(self, commit_steps):
+        positions = self.extract_effective_positions(commit_steps)
+    
+        if len(positions) <= 1:
             return 0.0
-
+    
         jumps = [abs(positions[i] - positions[i - 1]) for i in range(1, len(positions))]
-        counter = Counter(jumps)
-        total = sum(counter.values())
-        probs = [c / total for c in counter.values()]
-
-        entropy = -sum(p * math.log(p + 1e-12) for p in probs)
-        k = len(counter)
-        if k <= 1:
-            return 0.0
-        return entropy / math.log(k + 1e-12)
+        return sum(jumps) / len(jumps)
 
     @torch.no_grad()
     def sample(
@@ -1370,8 +1455,22 @@ class ForkAwareMDLMSampler(BaseSampler):
             # Some steps may be skipped if there are no transfers
             effective_steps = num_transfer_tokens.size(1)
 
+            if not hasattr(self, "_profile_time"):
+                self._profile_time = defaultdict(float)
+                self._profile_count = 0
+
+            # Cache heavy probe results across steps
+            cached_candidate_indices = None
+            cached_candidate_scores = None
+            cached_i_down_scores = None
+            cached_i_branch_scores = None
+            cached_structural_indices = None
+            cached_structural_scores = None
+
             # ----- Iterative reveal inside the current block -----
             for i in range(effective_steps):
+                t_step0 = _sync_time()
+            
                 logits, x0, mask_index = self.get_step_state(
                     x=x,
                     attention_mask=attention_mask,
@@ -1382,95 +1481,156 @@ class ForkAwareMDLMSampler(BaseSampler):
                     begin_suppress_tokens=begin_suppress_tokens,
                     right_shift_logits=right_shift_logits,
                 )
-
+                t1 = _sync_time()
+                self._profile_time["get_step_state"] += (t1 - t_step0)
+            
                 self.update_nfe_metric()
-
+            
                 self.update_prediction_history(
                     x0=x0,
                     mask_index=mask_index,
                     maxlen=config.consistency_window,
                 )
-
-                candidate_indices, candidate_scores = self.preselect_candidates(
-                    logits=logits,
-                    mask_index=mask_index,
-                    prompt_lens=prompt_lens,
-                    block_idx=b,
-                    block_size=block_size,
-                    max_new_tokens=max_new_tokens,
-                    top_m=config.probe_top_m,
-                    config=config,
+                t2 = _sync_time()
+                self._profile_time["history"] += (t2 - t1)
+            
+                # ------------------------------------------------------------
+                # Heavy structural probe is no longer executed every step.
+                # We only refresh it periodically and reuse cached results.
+                # ------------------------------------------------------------
+                need_probe = (
+                    i == 0
+                    or cached_structural_indices is None
+                    or (i % config.probe_interval == 0)
                 )
-
-                self.update_attempt_metrics(candidate_indices=candidate_indices)
-
-                i_down_scores = self.estimate_downstream_influence(
-                    x=x,
-                    attention_mask=attention_mask,
-                    logits=logits,
-                    candidate_indices=candidate_indices,
-                    mask_index=mask_index,
-                    prompt_lens=prompt_lens,
-                    block_idx=b,
-                    block_size=block_size,
-                    max_new_tokens=max_new_tokens,
-                    cfg_scale=cfg_scale,
-                    unmasked_index=unmasked_index,
-                    suppress_tokens=suppress_tokens,
-                    begin_suppress_tokens=begin_suppress_tokens,
-                    right_shift_logits=right_shift_logits,
-                    divergence_mode=config.probe_divergence,
-                )
-
-                i_branch_scores = self.estimate_branch_sensitivity(
-                    x=x,
-                    attention_mask=attention_mask,
-                    logits=logits,
-                    candidate_indices=candidate_indices,
-                    mask_index=mask_index,
-                    prompt_lens=prompt_lens,
-                    block_idx=b,
-                    block_size=block_size,
-                    max_new_tokens=max_new_tokens,
-                    cfg_scale=cfg_scale,
-                    unmasked_index=unmasked_index,
-                    suppress_tokens=suppress_tokens,
-                    begin_suppress_tokens=begin_suppress_tokens,
-                    right_shift_logits=right_shift_logits,
-                    divergence_mode=config.probe_divergence,
-                    top_k_values=config.branch_top_k_values,
-                )
-
-                branch_weights = self.get_branch_plausibility_weight(
-                    logits=logits,
-                    candidate_indices=candidate_indices,
-                )
-
-                i_branch_scores = i_branch_scores * branch_weights
-
-                structural_source_scores = self.fuse_structural_scores(
-                    i_down_scores=i_down_scores,
-                    i_branch_scores=i_branch_scores,
-                    alpha=config.alpha_struct,
-                    beta=config.beta_branch,
-                )
-
-                structural_indices, structural_scores = self.select_structural_candidates(
-                    candidate_indices=candidate_indices,
-                    structural_source_scores=structural_source_scores,
-                    top_k=config.structural_top_k,
-                )
-
+            
+                if need_probe:
+                    candidate_indices, candidate_scores = self.preselect_candidates(
+                        logits=logits,
+                        mask_index=mask_index,
+                        prompt_lens=prompt_lens,
+                        block_idx=b,
+                        block_size=block_size,
+                        max_new_tokens=max_new_tokens,
+                        top_m=config.probe_top_m,
+                        config=config,
+                    )
+                    t3 = _sync_time()
+                    self._profile_time["preselect"] += (t3 - t2)
+            
+                    self.update_attempt_metrics(candidate_indices=candidate_indices)
+            
+                    downstream_candidate_indices, downstream_selected_pos = self.select_downstream_candidates(
+                        candidate_indices=candidate_indices,
+                        candidate_scores=candidate_scores,
+                        top_r=config.downstream_top_r,
+                    )
+                    
+                    i_down_scores_small = self.estimate_downstream_influence(
+                        x=x,
+                        attention_mask=attention_mask,
+                        logits=logits,
+                        candidate_indices=downstream_candidate_indices,
+                        mask_index=mask_index,
+                        prompt_lens=prompt_lens,
+                        block_idx=b,
+                        block_size=block_size,
+                        max_new_tokens=max_new_tokens,
+                        cfg_scale=cfg_scale,
+                        unmasked_index=unmasked_index,
+                        suppress_tokens=suppress_tokens,
+                        begin_suppress_tokens=begin_suppress_tokens,
+                        right_shift_logits=right_shift_logits,
+                        divergence_mode=config.probe_divergence,
+                        downstream_window=config.downstream_window,
+                    )
+                    
+                    i_down_scores = self.scatter_downstream_scores(
+                        small_scores=i_down_scores_small,
+                        selected_pos=downstream_selected_pos,
+                        full_k=candidate_indices.shape[1],
+                    )
+                    t4 = _sync_time()
+                    self._profile_time["downstream_probe"] += (t4 - t3)
+            
+                    i_branch_scores = self.estimate_branch_sensitivity(
+                        x=x,
+                        attention_mask=attention_mask,
+                        logits=logits,
+                        candidate_indices=candidate_indices,
+                        mask_index=mask_index,
+                        prompt_lens=prompt_lens,
+                        block_idx=b,
+                        block_size=block_size,
+                        max_new_tokens=max_new_tokens,
+                        cfg_scale=cfg_scale,
+                        unmasked_index=unmasked_index,
+                        suppress_tokens=suppress_tokens,
+                        begin_suppress_tokens=begin_suppress_tokens,
+                        right_shift_logits=right_shift_logits,
+                        divergence_mode=config.probe_divergence,
+                        top_k_values=config.branch_top_k_values,
+                        branch_window=config.downstream_window,   # 或 config.branch_window
+                    )
+                    t5 = _sync_time()
+                    self._profile_time["branch_probe"] += (t5 - t4)
+            
+                    branch_weights = self.get_branch_plausibility_weight(
+                        logits=logits,
+                        candidate_indices=candidate_indices,
+                    )
+            
+                    i_branch_scores = i_branch_scores * branch_weights
+            
+                    structural_source_scores = self.fuse_structural_scores(
+                        i_down_scores=i_down_scores,
+                        i_branch_scores=i_branch_scores,
+                        alpha=config.alpha_struct,
+                        beta=config.beta_branch,
+                    )
+            
+                    structural_indices, structural_scores = self.select_structural_candidates(
+                        candidate_indices=candidate_indices,
+                        structural_source_scores=structural_source_scores,
+                        top_k=config.structural_top_k,
+                    )
+                    t6 = _sync_time()
+                    self._profile_time["structural_fuse_select"] += (t6 - t5)
+            
+                    # Update cache
+                    cached_candidate_indices = candidate_indices
+                    cached_candidate_scores = candidate_scores
+                    cached_i_down_scores = i_down_scores
+                    cached_i_branch_scores = i_branch_scores
+                    cached_structural_indices = structural_indices
+                    cached_structural_scores = structural_scores
+            
+                else:
+                    # Reuse previous heavy structural probe results
+                    candidate_indices = cached_candidate_indices
+                    candidate_scores = cached_candidate_scores
+                    i_down_scores = cached_i_down_scores
+                    i_branch_scores = cached_i_branch_scores
+                    structural_indices = cached_structural_indices
+                    structural_scores = cached_structural_scores
+                    t3 = _sync_time()
+                    t4 = t3
+                    t5 = t3
+                    t6 = t3
+            
+                # ------------------------------------------------------------
+                # Lightweight per-step filtering / commitment still runs every step
+                # ------------------------------------------------------------
                 entropy_scores = self.compute_candidate_entropy(
                     logits=logits,
                     structural_indices=structural_indices,
                 )
-
+            
                 consistency_scores = self.compute_consistency_scores(
                     structural_indices=structural_indices,
                     min_history=config.min_history_for_consistency,
                 )
-
+            
                 eligible_mask = self.get_eligible_candidates_minimal(
                     structural_indices=structural_indices,
                     entropy_scores=entropy_scores,
@@ -1478,26 +1638,28 @@ class ForkAwareMDLMSampler(BaseSampler):
                     entropy_threshold=config.entropy_threshold,
                     consistency_threshold=config.consistency_threshold,
                 )
-
+            
                 eligible_indices, eligible_counts = self.finalize_eligible_candidates(
                     structural_indices=structural_indices,
                     eligible_mask=eligible_mask,
                 )
-
+            
                 self.update_eligible_metric(
                     eligible_counts=eligible_counts,
                 )
-
+                t7 = _sync_time()
+                self._profile_time["eligibility"] += (t7 - t6)
+            
                 confidence_scores = self.compute_candidate_confidence(
                     logits=logits,
                     eligible_indices=eligible_indices,
                 )
-
+            
                 normalized_structural_scores = self.normalize_structural_scores_on_eligible(
                     structural_scores=structural_scores,
                     eligible_mask=eligible_mask,
                 )
-
+            
                 priority_scores = self.compute_commit_priority_minimal(
                     confidence_scores=confidence_scores,
                     normalized_structural_scores=normalized_structural_scores,
@@ -1505,13 +1667,15 @@ class ForkAwareMDLMSampler(BaseSampler):
                     lambda_confidence=config.lambda_confidence,
                     lambda_structural=config.lambda_structural,
                 )
-
+            
                 commit_indices, commit_mask = self.select_top_commit_candidates(
                     eligible_indices=eligible_indices,
                     priority_scores=priority_scores,
                     top_m=config.commit_top_m,
                 )
-
+                t8 = _sync_time()
+                self._profile_time["priority_commit"] += (t8 - t7)
+            
                 # Per-position confidence used for fallback selection
                 if remasking == "low_confidence":
                     p = F.softmax(logits, dim=-1)
@@ -1522,72 +1686,71 @@ class ForkAwareMDLMSampler(BaseSampler):
                     x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
                 else:
                     raise NotImplementedError(remasking)
-
+            
                 # Restrict selection window to the current block's tail region
                 for j in range(B):
                     x0_p[j, prompt_lens[j] + (b + 1) * block_size :] = -np.inf
-
+            
                 # Only allow updates at currently masked positions; keep others fixed
                 x0 = torch.where(mask_index, x0, x)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
-
-                # ------------------------------------------------------------------
-                # Step 7.5 / 7.6: integrate 3.4 commit_indices into real transfer logic
-                # ------------------------------------------------------------------
-
-                commit_phase_start = time.time()
-
+                t9 = _sync_time()
+                self._profile_time["fallback_confidence"] += (t9 - t8)
+            
+                commit_phase_start = _sync_time()
+            
                 # Convert [B, K] commit_indices -> [B, T] bool mask
                 commit_transfer_mask, commit_counts = self.commit_indices_to_mask(
                     commit_indices=commit_indices,
                     seq_len=x0.shape[1],
                 )
-
+            
                 # Safety: only keep currently masked positions
                 commit_transfer_mask = commit_transfer_mask & mask_index
-
+            
                 # Safety: restrict to current block window as well
                 for j in range(B):
                     commit_transfer_mask[j, prompt_lens[j] + (b + 1) * block_size :] = False
-
+            
                 # Start transfer set from structural commit candidates
                 transfer_index = commit_transfer_mask.clone()
-
+            
                 # Fill the remaining quota with original fallback selection
                 for j in range(B):
                     budget = int(num_transfer_tokens[j, i])
-
+            
                     already_selected = int(transfer_index[j].sum().item())
                     remaining = max(0, budget - already_selected)
-
+            
                     if remaining == 0:
                         continue
-
+            
                     # Exclude already selected positions from fallback
                     fallback_conf = confidence[j].clone()
                     fallback_conf[transfer_index[j]] = -np.inf
-
+            
                     # Only select if there are still valid positions
                     valid_count = int(torch.isfinite(fallback_conf).sum().item())
                     if valid_count == 0:
                         continue
-
+            
                     k_select = min(remaining, valid_count)
                     _, select_index = torch.topk(fallback_conf, k=k_select)
                     transfer_index[j, select_index] = True
-
+            
                 # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
-
-                commit_phase_end = time.time()
+            
+                commit_phase_end = _sync_time()
+                self._profile_time["commit_phase"] += (commit_phase_end - commit_phase_start)
                 self.metrics_state["commit_phase_time_sum"] += (commit_phase_end - commit_phase_start)
-
+            
                 self.update_commit_metrics(
                     commit_indices=commit_indices,
                     commit_counts=commit_counts,
                     transfer_index=transfer_index,
                 )
-
+            
                 self.update_readiness_from_commits(
                     commit_indices=commit_indices,
                     mask_index=mask_index,
@@ -1595,7 +1758,30 @@ class ForkAwareMDLMSampler(BaseSampler):
                     readiness_boost=config.readiness_boost,
                     readiness_decay=config.readiness_decay,
                 )
-
+                t10 = _sync_time()
+                self._profile_time["metrics_and_readiness"] += (t10 - commit_phase_end)
+            
+                self._profile_time["step_total"] += (t10 - t_step0)
+                self._profile_count += 1
+            
+                # 只打印前几个 step，避免刷屏
+                if i < 6 and b == 0:
+                    print(
+                        f"[PROFILE] step={i} need_probe={need_probe} "
+                        f"get_step_state={t1-t_step0:.4f}s "
+                        f"history={t2-t1:.4f}s "
+                        f"preselect={t3-t2:.4f}s "
+                        f"downstream={t4-t3:.4f}s "
+                        f"branch={t5-t4:.4f}s "
+                        f"struct_select={t6-t5:.4f}s "
+                        f"eligibility={t7-t6:.4f}s "
+                        f"priority={t8-t7:.4f}s "
+                        f"fallback={t9-t8:.4f}s "
+                        f"commit={commit_phase_end-commit_phase_start:.4f}s "
+                        f"post={t10-commit_phase_end:.4f}s "
+                        f"total={t10-t_step0:.4f}s"
+                    )
+            
                 if histories is not None:
                     histories.append(x.clone())
 
@@ -1604,7 +1790,7 @@ class ForkAwareMDLMSampler(BaseSampler):
         commit_traj = metrics["commit_trajectory"]
 
         jump_distances = [
-            self.compute_jump_entropy(traj)
+            self.compute_effective_jump_distance(traj)
             for traj in commit_traj
         ]
 

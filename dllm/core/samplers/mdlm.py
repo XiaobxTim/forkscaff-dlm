@@ -162,18 +162,29 @@ class MDLMSampler(BaseSampler):
     
     def compute_avg_jump_distance(self, commit_steps):
         positions = []
+    
         for step in commit_steps:
             for pos in step:
                 if pos >= 0:
                     positions.append(int(pos))
-
+    
         if len(positions) <= 1:
             return 0.0
-
+    
+        # remove consecutive duplicates
+        effective_positions = [positions[0]]
+        for pos in positions[1:]:
+            if pos != effective_positions[-1]:
+                effective_positions.append(pos)
+    
+        if len(effective_positions) <= 1:
+            return 0.0
+    
         jumps = [
-            abs(positions[i] - positions[i - 1])
-            for i in range(1, len(positions))
+            abs(effective_positions[i] - effective_positions[i - 1])
+            for i in range(1, len(effective_positions))
         ]
+    
         return sum(jumps) / len(jumps)
     
     @torch.no_grad()
