@@ -4,41 +4,33 @@ from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.registry import register_model
 
 from dllm.core.eval import MDLMEvalConfig, MDLMEvalHarness
-from dllm.core.samplers import MDLMSampler, MDLMSamplerConfig
 from dllm.core.samplers.config_builders import (
     get_named_sampler_config,
     apply_overrides,
 )
 
-
-@dataclass
-class LLaDAEvalSamplerConfig(MDLMSamplerConfig):
-    """Default sampler config for LLaDA eval."""
-    max_new_tokens: int = 512
-    steps: int = 128
-    block_size: int = 32
+from dllm.core.samplers import ForkAwareMDLMSampler, ForkAwareMDLMSamplerConfig
 
 
 @dataclass
-class LLaDAEvalConfig(MDLMEvalConfig):
-    """LLaDA eval config."""
+class ForkAwareEvalConfig(MDLMEvalConfig):
+    """Eval config for fork-aware decoding on top of LLaDA-style models."""
     max_length: int = 4096
 
 
-@register_model("llada")
-class LLaDAEvalHarness(MDLMEvalHarness):
+@register_model("forkaware")
+class ForkAwareEvalHarness(MDLMEvalHarness):
     def __init__(
         self,
-        eval_config: LLaDAEvalConfig | None = None,
-        sampler_config: MDLMSamplerConfig | None = None,
-        sampler_cls: type[MDLMSampler] = MDLMSampler,
+        eval_config: ForkAwareEvalConfig | None = None,
+        sampler_config: ForkAwareMDLMSamplerConfig | None = None,
+        sampler_cls: type[ForkAwareMDLMSampler] = ForkAwareMDLMSampler,
         **kwargs,
     ):
-        eval_config = eval_config or LLaDAEvalConfig()
+        eval_config = eval_config or ForkAwareEvalConfig()
 
-        # 关键改动：支持 config=...
         if sampler_config is None:
-            config_name = kwargs.pop("config", "baseline_default")
+            config_name = kwargs.pop("config", "forkaware_default")
             sampler_config = get_named_sampler_config(config_name)
             sampler_config = apply_overrides(sampler_config, kwargs)
 
