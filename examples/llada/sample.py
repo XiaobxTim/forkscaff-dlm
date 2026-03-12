@@ -12,6 +12,8 @@ import time
 
 import torch
 
+import json
+from pathlib import Path
 
 @dataclass
 class ScriptArguments:
@@ -186,17 +188,42 @@ def extract_first_unmask_order(histories, tokenizer, mask_token_id):
 
     return results
 
+def save_first_unmask_order(save_path, first_unmask_orders):
+    """
+    first_unmask_orders:
+        list over samples, each sample is
+        [(step, pos, token_id, token_str), ...]
+    """
+    payload = {}
+
+    for i, sample_order in enumerate(first_unmask_orders):
+        payload[f"sample_{i}"] = [
+            {
+                "step": int(step),
+                "pos": int(pos),
+                "token_id": int(token_id),
+                "token": str(token),
+            }
+            for step, pos, token_id, token in sample_order
+        ]
+
+    Path(save_path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[Saved] {save_path}")
+
 mask_token_id = tokenizer.mask_token_id
-first_orders = extract_first_unmask_order(
+baseline_first_orders = extract_first_unmask_order(
     histories=outputs.histories,
     tokenizer=tokenizer,
-    mask_token_id=mask_token_id,
+    mask_token_id=tokenizer.mask_token_id,
 )
 
-for sample_id, order in enumerate(first_orders):
-    print(f"\n===== Sample {sample_id} First-Unmask Order =====")
-    for step, pos, token_id, token_str in order:
-        print(f"step {step:3d} | pos {pos:3d} | token {repr(token_str)}")
+save_first_unmask_order(
+    "baseline_first_unmask.json",
+    baseline_first_orders,
+)
 
 if script_args.visualize:
     terminal_visualizer.visualize(outputs.histories, rich=True)

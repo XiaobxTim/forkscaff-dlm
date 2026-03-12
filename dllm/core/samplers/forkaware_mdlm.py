@@ -123,7 +123,68 @@ class ForkAwareMDLMSampler(BaseSampler):
             "commit_trajectory": [[] for _ in range(batch_size)],
             "commit_phase_time_sum": 0.0,
             "commit_phase_struct_time_sum": 0.0,
+
+            "position_first_seen_struct_score": torch.full(
+                (batch_size, seq_len),
+                float("nan"),
+                dtype=torch.float32,
+                device=device,
+            ),
+            
+            "position_precommit_max_struct_score": torch.full(
+                (batch_size, seq_len),
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
+            ),
+            
+            "position_commit_step_struct_score": torch.full(
+                (batch_size, seq_len),
+                float("nan"),
+                dtype=torch.float32,
+                device=device,
+            ),
+            
+            "position_first_commit_step": torch.full(
+                (batch_size, seq_len),
+                -1,
+                dtype=torch.long,
+                device=device,
+            ),
         }
+
+    def update_position_score_traces(
+        self,
+        candidate_indices,
+        structural_source_scores,
+        mask_index,
+    ):
+        if self.metrics_state is None:
+            return
+    
+        first_seen = self.metrics_state["position_first_seen_struct_score"]
+        precommit_max = self.metrics_state["position_precommit_max_struct_score"]
+        first_commit_step = self.metrics_state["position_first_commit_step"]
+    
+        B, K = candidate_indices.shape
+    
+        for j in range(B):
+            for k in range(K):
+                pos = int(candidate_indices[j, k].item())
+                if pos < 0:
+                    continue
+                if not bool(mask_index[j, pos].item()):
+                    continue
+    
+                score = structural_source_scores[j, k].float()
+    
+                # 第一次看到这个位置时的结构分数
+                if torch.isnan(first_seen[j, pos]):
+                    first_seen[j, pos] = score
+    
+                # 仅在它尚未 first-commit 前，累计 precommit max
+                if int(first_commit_step[j, pos].item()) < 0:
+                    precommit_max[j, pos] = torch.maximum(precommit_max[j, pos], score)
 
     def compute_ready_mask(
         self,
@@ -1280,6 +1341,11 @@ class ForkAwareMDLMSampler(BaseSampler):
             "commit_stage_total_tps": commit_stage_total_tps.tolist(),
             "commit_stage_struct_efficiency": commit_stage_struct_efficiency.tolist(),
             "structural_commit_ratio": structural_commit_ratio.tolist(),
+
+            "position_first_seen_struct_score": self.metrics_state["position_first_seen_struct_score"].tolist(),
+            "position_precommit_max_struct_score": self.metrics_state["position_precommit_max_struct_score"].tolist(),
+            "position_commit_step_struct_score": self.metrics_state["position_commit_step_struct_score"].tolist(),
+            "position_first_commit_step": self.metrics_state["position_first_commit_step"].tolist(),
         }
         return metrics
     
@@ -1312,6 +1378,46 @@ class ForkAwareMDLMSampler(BaseSampler):
     
         jumps = [abs(positions[i] - positions[i - 1]) for i in range(1, len(positions))]
         return sum(jumps) / len(jumps)
+
+    def update_first_commit_traces(
+        self,
+        transfer_index,
+        current_step,
+        candidate_indices=None,
+        structural_source_scores=None,
+    ):
+        if self.metrics_state is None:
+            return
+    
+        first_commit_step = self.metrics_state["position_first_commit_step"]
+        commit_step_score = self.metrics_state["position_commit_step_struct_score"]
+    
+        B, T = transfer_index.shape
+    
+        # 可选：如果这一步某些被 commit 的位置也在 candidate list 里，就记下该步 score
+        score_maps = []
+        if candidate_indices is not None and structural_source_scores is not None:
+            for j in range(B):
+                mp = {}
+                for k in range(candidate_indices.shape[1]):
+                    pos = int(candidate_indices[j, k].item())
+                    if pos >= 0:
+                        mp[pos] = float(structural_source_scores[j, k].item())
+                score_maps.append(mp)
+        else:
+            score_maps = [None for _ in range(B)]
+    
+        for j in range(B):
+            commit_pos = torch.nonzero(transfer_index[j], as_tuple=False).squeeze(-1)
+            for pos_t in commit_pos.tolist():
+                pos = int(pos_t)
+    
+                if int(first_commit_step[j, pos].item()) < 0:
+                    first_commit_step[j, pos] = current_step
+    
+                    mp = score_maps[j]
+                    if mp is not None and pos in mp and torch.isnan(commit_step_score[j, pos]):
+                        commit_step_score[j, pos] = mp[pos]
 
     @torch.no_grad()
     def sample(
@@ -1455,9 +1561,6 @@ class ForkAwareMDLMSampler(BaseSampler):
             # Some steps may be skipped if there are no transfers
             effective_steps = num_transfer_tokens.size(1)
 
-            if not hasattr(self, "_profile_time"):
-                self._profile_time = defaultdict(float)
-                self._profile_count = 0
 
             # Cache heavy probe results across steps
             cached_candidate_indices = None
@@ -1466,6 +1569,7 @@ class ForkAwareMDLMSampler(BaseSampler):
             cached_i_branch_scores = None
             cached_structural_indices = None
             cached_structural_scores = None
+            cached_structural_source_scores = None
 
             # ----- Iterative reveal inside the current block -----
             for i in range(effective_steps):
@@ -1481,8 +1585,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                     begin_suppress_tokens=begin_suppress_tokens,
                     right_shift_logits=right_shift_logits,
                 )
-                t1 = _sync_time()
-                self._profile_time["get_step_state"] += (t1 - t_step0)
             
                 self.update_nfe_metric()
             
@@ -1491,8 +1593,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                     mask_index=mask_index,
                     maxlen=config.consistency_window,
                 )
-                t2 = _sync_time()
-                self._profile_time["history"] += (t2 - t1)
             
                 # ------------------------------------------------------------
                 # Heavy structural probe is no longer executed every step.
@@ -1515,8 +1615,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                         top_m=config.probe_top_m,
                         config=config,
                     )
-                    t3 = _sync_time()
-                    self._profile_time["preselect"] += (t3 - t2)
             
                     self.update_attempt_metrics(candidate_indices=candidate_indices)
             
@@ -1550,8 +1648,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                         selected_pos=downstream_selected_pos,
                         full_k=candidate_indices.shape[1],
                     )
-                    t4 = _sync_time()
-                    self._profile_time["downstream_probe"] += (t4 - t3)
             
                     i_branch_scores = self.estimate_branch_sensitivity(
                         x=x,
@@ -1572,8 +1668,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                         top_k_values=config.branch_top_k_values,
                         branch_window=config.downstream_window,   # 或 config.branch_window
                     )
-                    t5 = _sync_time()
-                    self._profile_time["branch_probe"] += (t5 - t4)
             
                     branch_weights = self.get_branch_plausibility_weight(
                         logits=logits,
@@ -1588,14 +1682,18 @@ class ForkAwareMDLMSampler(BaseSampler):
                         alpha=config.alpha_struct,
                         beta=config.beta_branch,
                     )
+
+                    self.update_position_score_traces(
+                        candidate_indices=candidate_indices,
+                        structural_source_scores=structural_source_scores,
+                        mask_index=mask_index,
+                    )
             
                     structural_indices, structural_scores = self.select_structural_candidates(
                         candidate_indices=candidate_indices,
                         structural_source_scores=structural_source_scores,
                         top_k=config.structural_top_k,
                     )
-                    t6 = _sync_time()
-                    self._profile_time["structural_fuse_select"] += (t6 - t5)
             
                     # Update cache
                     cached_candidate_indices = candidate_indices
@@ -1604,6 +1702,7 @@ class ForkAwareMDLMSampler(BaseSampler):
                     cached_i_branch_scores = i_branch_scores
                     cached_structural_indices = structural_indices
                     cached_structural_scores = structural_scores
+                    cached_structural_source_scores = structural_source_scores
             
                 else:
                     # Reuse previous heavy structural probe results
@@ -1613,10 +1712,7 @@ class ForkAwareMDLMSampler(BaseSampler):
                     i_branch_scores = cached_i_branch_scores
                     structural_indices = cached_structural_indices
                     structural_scores = cached_structural_scores
-                    t3 = _sync_time()
-                    t4 = t3
-                    t5 = t3
-                    t6 = t3
+                    structural_source_scores = cached_structural_source_scores
             
                 # ------------------------------------------------------------
                 # Lightweight per-step filtering / commitment still runs every step
@@ -1647,8 +1743,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                 self.update_eligible_metric(
                     eligible_counts=eligible_counts,
                 )
-                t7 = _sync_time()
-                self._profile_time["eligibility"] += (t7 - t6)
             
                 confidence_scores = self.compute_candidate_confidence(
                     logits=logits,
@@ -1673,8 +1767,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                     priority_scores=priority_scores,
                     top_m=config.commit_top_m,
                 )
-                t8 = _sync_time()
-                self._profile_time["priority_commit"] += (t8 - t7)
             
                 # Per-position confidence used for fallback selection
                 if remasking == "low_confidence":
@@ -1694,10 +1786,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                 # Only allow updates at currently masked positions; keep others fixed
                 x0 = torch.where(mask_index, x0, x)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
-                t9 = _sync_time()
-                self._profile_time["fallback_confidence"] += (t9 - t8)
-            
-                commit_phase_start = _sync_time()
             
                 # Convert [B, K] commit_indices -> [B, T] bool mask
                 commit_transfer_mask, commit_counts = self.commit_indices_to_mask(
@@ -1740,11 +1828,16 @@ class ForkAwareMDLMSampler(BaseSampler):
             
                 # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
-            
-                commit_phase_end = _sync_time()
-                self._profile_time["commit_phase"] += (commit_phase_end - commit_phase_start)
-                self.metrics_state["commit_phase_time_sum"] += (commit_phase_end - commit_phase_start)
-            
+
+                global_step = b * effective_steps + i
+
+                self.update_first_commit_traces(
+                    transfer_index=transfer_index,
+                    current_step=global_step,
+                    candidate_indices=candidate_indices if need_probe else cached_candidate_indices,
+                    structural_source_scores=structural_source_scores if need_probe else None,
+                )
+                        
                 self.update_commit_metrics(
                     commit_indices=commit_indices,
                     commit_counts=commit_counts,
@@ -1758,29 +1851,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                     readiness_boost=config.readiness_boost,
                     readiness_decay=config.readiness_decay,
                 )
-                t10 = _sync_time()
-                self._profile_time["metrics_and_readiness"] += (t10 - commit_phase_end)
-            
-                self._profile_time["step_total"] += (t10 - t_step0)
-                self._profile_count += 1
-            
-                # 只打印前几个 step，避免刷屏
-                if i < 6 and b == 0:
-                    print(
-                        f"[PROFILE] step={i} need_probe={need_probe} "
-                        f"get_step_state={t1-t_step0:.4f}s "
-                        f"history={t2-t1:.4f}s "
-                        f"preselect={t3-t2:.4f}s "
-                        f"downstream={t4-t3:.4f}s "
-                        f"branch={t5-t4:.4f}s "
-                        f"struct_select={t6-t5:.4f}s "
-                        f"eligibility={t7-t6:.4f}s "
-                        f"priority={t8-t7:.4f}s "
-                        f"fallback={t9-t8:.4f}s "
-                        f"commit={commit_phase_end-commit_phase_start:.4f}s "
-                        f"post={t10-commit_phase_end:.4f}s "
-                        f"total={t10-t_step0:.4f}s"
-                    )
             
                 if histories is not None:
                     histories.append(x.clone())

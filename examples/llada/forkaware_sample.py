@@ -10,6 +10,11 @@ import dllm
 
 import time
 
+import json
+from pathlib import Path
+import math
+import numpy as np
+import matplotlib.pyplot as plt
 
 @dataclass
 class ScriptArguments:
@@ -145,17 +150,270 @@ def extract_first_unmask_order(histories, tokenizer, mask_token_id):
 
     return results
 
+def save_first_unmask_order(save_path, first_unmask_orders):
+    """
+    first_unmask_orders:
+        list over samples, each sample is
+        [(step, pos, token_id, token_str), ...]
+    """
+    payload = {}
+
+    for i, sample_order in enumerate(first_unmask_orders):
+        payload[f"sample_{i}"] = [
+            {
+                "step": int(step),
+                "pos": int(pos),
+                "token_id": int(token_id),
+                "token": str(token),
+            }
+            for step, pos, token_id, token in sample_order
+        ]
+
+    Path(save_path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[Saved] {save_path}")
+
 mask_token_id = tokenizer.mask_token_id
-first_orders = extract_first_unmask_order(
+forkaware_first_orders = extract_first_unmask_order(
     histories=outputs.histories,
     tokenizer=tokenizer,
-    mask_token_id=mask_token_id,
+    mask_token_id=tokenizer.mask_token_id,
 )
 
-for sample_id, order in enumerate(first_orders):
-    print(f"\n===== Sample {sample_id} First-Unmask Order =====")
-    for step, pos, token_id, token_str in order:
-        print(f"step {step:3d} | pos {pos:3d} | token {repr(token_str)}")
+save_first_unmask_order(
+    "forkaware_first_unmask.json",
+    forkaware_first_orders,
+)
+
+def build_score_commit_pairs_from_metrics(metrics):
+    """
+    metrics["position_precommit_max_struct_score"]: list[B][T]
+    metrics["position_first_commit_step"]: list[B][T]
+
+    returns:
+        pairs: list of (score, first_commit_step)
+    """
+    if "position_precommit_max_struct_score" not in metrics:
+        raise KeyError("Missing metrics['position_precommit_max_struct_score']")
+    if "position_first_commit_step" not in metrics:
+        raise KeyError("Missing metrics['position_first_commit_step']")
+
+    all_scores = metrics["position_precommit_max_struct_score"]
+    all_steps = metrics["position_first_commit_step"]
+
+    pairs = []
+
+    for b in range(len(all_scores)):
+        scores = all_scores[b]
+        steps = all_steps[b]
+
+        for pos in range(len(scores)):
+            score = scores[pos]
+            step = steps[pos]
+
+            # 过滤无效值
+            if step is None or int(step) < 0:
+                continue
+            if score is None:
+                continue
+
+            try:
+                score = float(score)
+            except Exception:
+                continue
+
+            if math.isnan(score) or math.isinf(score):
+                continue
+
+            pairs.append((score, int(step)))
+
+    return pairs
+
+def save_score_commit_pairs(save_path, pairs):
+    payload = [
+        {"score": float(score), "first_commit_step": int(step)}
+        for score, step in pairs
+    ]
+    Path(save_path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[Saved] {save_path}")
+
+def compute_score_commit_correlation(pairs):
+    if len(pairs) < 3:
+        print("Not enough pairs for correlation.")
+        return None
+
+    scores = np.array([p[0] for p in pairs], dtype=float)
+    steps = np.array([p[1] for p in pairs], dtype=float)
+
+    pearson = np.corrcoef(scores, steps)[0, 1]
+
+    score_ranks = scores.argsort().argsort().astype(float)
+    step_ranks = steps.argsort().argsort().astype(float)
+    spearman = np.corrcoef(score_ranks, step_ranks)[0, 1]
+
+    print(f"Pearson(score, first_commit_step): {pearson:.6f}")
+    print(f"Spearman(score, first_commit_step): {spearman:.6f}")
+
+    return pearson, spearman
+
+def plot_score_commit_scatter(
+    pairs,
+    save_path="influence_commit_scatter.png",
+    title="Structural Score vs First Commit Step",
+):
+    if len(pairs) == 0:
+        print("No pairs to plot.")
+        return
+
+    scores = np.array([p[0] for p in pairs], dtype=float)
+    steps = np.array([p[1] for p in pairs], dtype=float)
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(scores, steps, alpha=0.45, s=16)
+    plt.xlabel("Pre-commit max structural score")
+    plt.ylabel("First commit step")
+    plt.title(title)
+    plt.grid(alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.close()
+
+    print(f"[Saved] {save_path}")
+
+def plot_score_commit_binned(
+    pairs,
+    save_path="influence_commit_binned.png",
+    title="Influence-Commit Trend",
+    num_bins=5,
+):
+    if len(pairs) == 0:
+        print("No pairs to plot.")
+        return
+
+    scores = np.array([p[0] for p in pairs], dtype=float)
+    steps = np.array([p[1] for p in pairs], dtype=float)
+
+    # 分位数分桶
+    edges = np.quantile(scores, np.linspace(0.0, 1.0, num_bins + 1))
+    edges = np.unique(edges)
+
+    if len(edges) < 3:
+        print("Not enough score variation for binning.")
+        return
+
+    xs, ys, yerr, labels = [], [], [], []
+
+    for i in range(len(edges) - 1):
+        lo, hi = edges[i], edges[i + 1]
+
+        if i == len(edges) - 2:
+            mask = (scores >= lo) & (scores <= hi)
+        else:
+            mask = (scores >= lo) & (scores < hi)
+
+        if mask.sum() == 0:
+            continue
+
+        xs.append((lo + hi) / 2.0)
+        ys.append(steps[mask].mean())
+        yerr.append(steps[mask].std())
+        labels.append(f"[{lo:.3f}, {hi:.3f}]")
+
+    plt.figure(figsize=(6, 5))
+    plt.errorbar(xs, ys, yerr=yerr, marker="o", capsize=4)
+    plt.xlabel("Structural score (binned)")
+    plt.ylabel("Average first commit step")
+    plt.title(title)
+    plt.grid(alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.close()
+
+    print(f"[Saved] {save_path}")
+    print("Bin labels:", labels)
+
+def build_score_commit_pairs_per_sample(metrics):
+    if "position_precommit_max_struct_score" not in metrics:
+        raise KeyError("Missing metrics['position_precommit_max_struct_score']")
+    if "position_first_commit_step" not in metrics:
+        raise KeyError("Missing metrics['position_first_commit_step']")
+
+    all_scores = metrics["position_precommit_max_struct_score"]
+    all_steps = metrics["position_first_commit_step"]
+
+    results = []
+
+    for b in range(len(all_scores)):
+        pairs = []
+        scores = all_scores[b]
+        steps = all_steps[b]
+
+        for pos in range(len(scores)):
+            score = scores[pos]
+            step = steps[pos]
+
+            if step is None or int(step) < 0:
+                continue
+            if score is None:
+                continue
+
+            try:
+                score = float(score)
+            except Exception:
+                continue
+
+            if math.isnan(score) or math.isinf(score):
+                continue
+
+            pairs.append((score, int(step)))
+
+        results.append(pairs)
+
+    return results
+
+pairs = build_score_commit_pairs_from_metrics(outputs.metrics)
+print("num_score_commit_pairs:", len(pairs))
+
+save_score_commit_pairs("forkaware_score_commit_pairs.json", pairs)
+
+compute_score_commit_correlation(pairs)
+
+# plot_score_commit_scatter(
+#     pairs,
+#     save_path="forkaware_influence_commit_scatter.png",
+#     title="ForkAware: Structural Score vs First Commit Step",
+# )
+
+# plot_score_commit_binned(
+#     pairs,
+#     save_path="forkaware_influence_commit_binned.png",
+#     title="ForkAware: Structural Score vs First Commit Step (Binned)",
+# )
+
+pairs_per_sample = build_score_commit_pairs_per_sample(outputs.metrics)
+for sample_idx, sample_pairs in enumerate(pairs_per_sample):
+    print(f"[Sample {sample_idx}] num_pairs={len(sample_pairs)}")
+    if len(sample_pairs) == 0:
+        continue
+
+    compute_score_commit_correlation(sample_pairs)
+
+    # plot_score_commit_scatter(
+    #     sample_pairs,
+    #     save_path=f"forkaware_sample{sample_idx}_scatter.png",
+    #     title=f"Sample {sample_idx}: Structural Score vs First Commit Step",
+    # )
+
+    # plot_score_commit_binned(
+    #     sample_pairs,
+    #     save_path=f"forkaware_sample{sample_idx}_binned.png",
+    #     title=f"Sample {sample_idx}: Structural Score vs First Commit Step (Binned)",
+    # )
 
 if script_args.visualize:
     terminal_visualizer.visualize(outputs.histories, rich=True)
