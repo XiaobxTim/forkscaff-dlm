@@ -1,0 +1,17 @@
+include: mbpp.yaml
+task: mbpp_passk
+task_alias: mbpp_passk
+
+generation_kwargs:
+  do_sample: true
+  temperature: 0.8
+  top_p: 0.95
+  max_gen_toks: 512
+
+repeats: 5
+
+metric_list:
+  - metric: !function utils_passk.pass_at_k_code
+    aggregation: mean
+    higher_is_better: true
+    k: [1, 5]

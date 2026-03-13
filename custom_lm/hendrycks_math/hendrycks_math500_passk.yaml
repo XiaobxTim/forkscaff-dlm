@@ -1,0 +1,18 @@
+include: hendrycks_math500.yaml
+task: hendrycks_math500_passk
+task_alias: hendrycks_math500_passk
+
+generation_kwargs:
+  do_sample: true
+  temperature: 0.8
+  top_p: 0.95
+  max_gen_toks: 1024
+
+repeats: 5
+
+metric_list:
+  - metric: !function utils_passk.pass_at_k_reasoning
+    aggregation: mean
+    higher_is_better: true
+    k: [1, 5]
+    task_type: math500
