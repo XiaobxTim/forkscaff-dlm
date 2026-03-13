@@ -9,10 +9,20 @@ def load_json(path):
         return json.load(f)
 
 def find_result(task_dir):
-    files = list(task_dir.glob("*.json"))
-    if not files:
+    if not task_dir.exists():
         return None
-    return load_json(files[0])
+
+    # 先找当前目录下的 json
+    files = list(task_dir.glob("*.json"))
+    if files:
+        return load_json(files[0])
+
+    # 当前层没有的话，递归往下找
+    files = list(task_dir.rglob("*.json"))
+    if files:
+        return load_json(files[0])
+
+    return None
 
 def extract_gsm8k(res):
     try:
@@ -22,13 +32,16 @@ def extract_gsm8k(res):
 
 def extract_math(res):
     try:
-        return res["results"]["hendrycks_math500"]["exact_match"]
+        return res["results"]["hendrycks_math500"]["exact_match,none"]
     except:
         return None
 
 def extract_code(res, task):
     try:
-        return res["results"][task]["pass@1"]
+        if task == 'humaneval':
+            return res["results"][task]["pass@1,create_test"]
+        else:
+            return res["results"][task]["pass_at_1,none"]
     except:
         return None
 
