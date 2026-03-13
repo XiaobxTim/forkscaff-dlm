@@ -127,21 +127,6 @@ class MDLMSampler(BaseSampler):
         commit_phase_time_sum = float(self.metrics_state["commit_phase_time_sum"])
         latency_commit_phase_per_sample = commit_phase_time_sum / max(batch_size, 1)
 
-        commit_stage_total_tps = (
-            self.metrics_state["total_commit_total"].float()
-            / max(latency_commit_phase_per_sample, 1e-12)
-        )
-
-        commit_stage_struct_efficiency = (
-            self.metrics_state["struct_commit_total"].float()
-            / max(latency_commit_phase_per_sample, 1e-12)
-        )
-
-        structural_commit_ratio = (
-            self.metrics_state["struct_commit_total"].float()
-            / self.metrics_state["total_commit_total"].clamp_min(1).float()
-        )
-
         attempt_counts = self.metrics_state["attempt_counts"]
         avg_attempt = attempt_counts.float().mean(dim=-1)
         max_attempt = attempt_counts.max(dim=-1).values
@@ -152,9 +137,6 @@ class MDLMSampler(BaseSampler):
             "latency_commit_phase_per_sample": latency_commit_phase_per_sample,
             "total_commit_total": self.metrics_state["total_commit_total"].tolist(),
             "struct_commit_total": self.metrics_state["struct_commit_total"].tolist(),
-            "commit_stage_total_tps": commit_stage_total_tps.tolist(),
-            "commit_stage_struct_efficiency": commit_stage_struct_efficiency.tolist(),
-            "structural_commit_ratio": structural_commit_ratio.tolist(),
             "avg_attempt": avg_attempt.tolist(),
             "max_attempt": max_attempt.tolist(),
             "commit_trajectory": self.metrics_state["commit_trajectory"],

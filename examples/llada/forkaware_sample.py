@@ -90,8 +90,6 @@ for iter, s in enumerate(sequences):
     print(s.strip() if s.strip() else "<empty>")
 print("\n" + "=" * 80 + "\n")
 
-print("mean_commit_stage_total_tps:",
-      mean_list(outputs.metrics["commit_stage_total_tps"]))
 print("mean_commit_stage_struct_efficiency:",
       mean_list(outputs.metrics["commit_stage_struct_efficiency"]))
 print("mean_structural_commit_ratio:",
@@ -114,6 +112,18 @@ total_generated_tokens = sum(generated_token_counts)
 decode_tps = total_generated_tokens / elapsed
 print("total_generated_tokens:", total_generated_tokens)
 print("decode_tps:", decode_tps)
+
+attempt_list = outputs.metrics["avg_attempt"]
+nfe_list = outputs.metrics["nfe"]
+
+attempt_ratio_list = [
+    a / n if n > 0 else 0.0
+    for a, n in zip(attempt_list, nfe_list)
+]
+
+mean_attempt_ratio = mean_list(attempt_ratio_list)
+
+print("mean_attempt_ratio:", mean_attempt_ratio)
 
 def extract_first_unmask_order(histories, tokenizer, mask_token_id):
     """
@@ -175,17 +185,17 @@ def save_first_unmask_order(save_path, first_unmask_orders):
     )
     print(f"[Saved] {save_path}")
 
-mask_token_id = tokenizer.mask_token_id
-forkaware_first_orders = extract_first_unmask_order(
-    histories=outputs.histories,
-    tokenizer=tokenizer,
-    mask_token_id=tokenizer.mask_token_id,
-)
+# mask_token_id = tokenizer.mask_token_id
+# forkaware_first_orders = extract_first_unmask_order(
+#     histories=outputs.histories,
+#     tokenizer=tokenizer,
+#     mask_token_id=tokenizer.mask_token_id,
+# )
 
-save_first_unmask_order(
-    "forkaware_first_unmask.json",
-    forkaware_first_orders,
-)
+# save_first_unmask_order(
+#     "forkaware_first_unmask.json",
+#     forkaware_first_orders,
+# )
 
 def build_score_commit_pairs_from_metrics(metrics):
     """
@@ -376,12 +386,13 @@ def build_score_commit_pairs_per_sample(metrics):
 
     return results
 
-pairs = build_score_commit_pairs_from_metrics(outputs.metrics)
-print("num_score_commit_pairs:", len(pairs))
+## Compute Structure Score
+# pairs = build_score_commit_pairs_from_metrics(outputs.metrics)
+# print("num_score_commit_pairs:", len(pairs))
 
-save_score_commit_pairs("forkaware_score_commit_pairs.json", pairs)
+# save_score_commit_pairs("forkaware_score_commit_pairs.json", pairs)
 
-compute_score_commit_correlation(pairs)
+# compute_score_commit_correlation(pairs)
 
 # plot_score_commit_scatter(
 #     pairs,
@@ -395,13 +406,13 @@ compute_score_commit_correlation(pairs)
 #     title="ForkAware: Structural Score vs First Commit Step (Binned)",
 # )
 
-pairs_per_sample = build_score_commit_pairs_per_sample(outputs.metrics)
-for sample_idx, sample_pairs in enumerate(pairs_per_sample):
-    print(f"[Sample {sample_idx}] num_pairs={len(sample_pairs)}")
-    if len(sample_pairs) == 0:
-        continue
+# pairs_per_sample = build_score_commit_pairs_per_sample(outputs.metrics)
+# for sample_idx, sample_pairs in enumerate(pairs_per_sample):
+#     print(f"[Sample {sample_idx}] num_pairs={len(sample_pairs)}")
+#     if len(sample_pairs) == 0:
+#         continue
 
-    compute_score_commit_correlation(sample_pairs)
+#     compute_score_commit_correlation(sample_pairs)
 
     # plot_score_commit_scatter(
     #     sample_pairs,

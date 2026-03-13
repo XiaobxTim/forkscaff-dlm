@@ -104,7 +104,7 @@ class ForkAwareMDLMSampler(BaseSampler):
     ):
         self.metrics_state = {
             # efficiency
-            "nfe": 0,
+            "nfe": torch.zeros(batch_size, dtype=torch.long, device=device),
 
             # commitment
             "struct_commit_total": torch.zeros(batch_size, dtype=torch.long, device=device),
@@ -1315,7 +1315,7 @@ class ForkAwareMDLMSampler(BaseSampler):
         max_attempt = attempt_counts.max(dim=-1).values
 
         metrics = {
-            "nfe": int(self.metrics_state["nfe"]),
+            "nfe": self.metrics_state["nfe"].tolist(),
 
             "struct_commit_total": self.metrics_state["struct_commit_total"].tolist(),
             "total_commit_total": self.metrics_state["total_commit_total"].tolist(),
@@ -1338,7 +1338,6 @@ class ForkAwareMDLMSampler(BaseSampler):
             "commit_phase_time_sum": commit_phase_time_sum,
             "latency_commit_phase_per_sample": latency_commit_phase_per_sample,
 
-            "commit_stage_total_tps": commit_stage_total_tps.tolist(),
             "commit_stage_struct_efficiency": commit_stage_struct_efficiency.tolist(),
             "structural_commit_ratio": structural_commit_ratio.tolist(),
 
@@ -1573,7 +1572,6 @@ class ForkAwareMDLMSampler(BaseSampler):
 
             # ----- Iterative reveal inside the current block -----
             for i in range(effective_steps):
-                t_step0 = _sync_time()
             
                 logits, x0, mask_index = self.get_step_state(
                     x=x,
@@ -1616,7 +1614,6 @@ class ForkAwareMDLMSampler(BaseSampler):
                         config=config,
                     )
             
-                    self.update_attempt_metrics(candidate_indices=candidate_indices)
             
                     downstream_candidate_indices, downstream_selected_pos = self.select_downstream_candidates(
                         candidate_indices=candidate_indices,
@@ -1713,6 +1710,8 @@ class ForkAwareMDLMSampler(BaseSampler):
                     structural_indices = cached_structural_indices
                     structural_scores = cached_structural_scores
                     structural_source_scores = cached_structural_source_scores
+
+                self.update_attempt_metrics(candidate_indices=candidate_indices)
             
                 # ------------------------------------------------------------
                 # Lightweight per-step filtering / commitment still runs every step
@@ -1786,6 +1785,8 @@ class ForkAwareMDLMSampler(BaseSampler):
                 # Only allow updates at currently masked positions; keep others fixed
                 x0 = torch.where(mask_index, x0, x)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
+
+                commit_start = _sync_time()
             
                 # Convert [B, K] commit_indices -> [B, T] bool mask
                 commit_transfer_mask, commit_counts = self.commit_indices_to_mask(
@@ -1851,6 +1852,10 @@ class ForkAwareMDLMSampler(BaseSampler):
                     readiness_boost=config.readiness_boost,
                     readiness_decay=config.readiness_decay,
                 )
+
+                commit_end = _sync_time()
+                commit_time = commit_end - commit_start
+                self.metrics_state["commit_phase_time_sum"] += commit_time
             
                 if histories is not None:
                     histories.append(x.clone())
